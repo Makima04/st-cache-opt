@@ -18,6 +18,7 @@ import {
     selected_world_info,
     world_info,
 } from '../../world-info.js';
+import { power_user } from '../../power-user.js';
 
 const MODULE_NAME = 'deepseek_cache_optimizer';
 const EXTENSION_FOLDER_NAME = 'st-cache-opt';
@@ -48,7 +49,7 @@ const defaultSettings = {
 };
 
 const DB_NAME = 'deepseek-cache-optimizer-memory';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const MEMORY_INJECTION_MARKER = '<记忆数据库>';
 
 const TABLE_SCHEMAS = {
@@ -60,19 +61,42 @@ const TABLE_SCHEMAS = {
     protagonist_info: {
         label: '角色信息',
         singleton: true,
-        columns: ['name', 'appearance', 'personality', 'currentState'],
+        columns: ['name', 'appearance', 'personality', 'currentState', 'background', 'traits', 'abilities'],
+    },
+    user_info: {
+        label: 'User角色',
+        singleton: true,
+        columns: ['name', 'appearance', 'personality', 'persona'],
     },
     important_characters: {
         label: '重要角色',
         singleton: false,
         keyColumn: 'name',
-        columns: ['name', 'role', 'appearance', 'relationship', 'status'],
+        columns: ['name', 'role', 'appearance', 'relationship', 'status', 'traits', 'lastInteraction'],
     },
     chronicle: {
         label: '编年史',
         singleton: false,
         keyColumn: 'amCode',
         columns: ['amCode', 'summary', 'entities', 'keywords', 'turn', 'importance'],
+    },
+    items: {
+        label: '物品',
+        singleton: false,
+        keyColumn: 'name',
+        columns: ['name', 'type', 'owner', 'description', 'location', 'status'],
+    },
+    relationships: {
+        label: '关系',
+        singleton: false,
+        keyColumn: 'relKey',
+        columns: ['relKey', 'fromChar', 'toChar', 'type', 'value', 'notes'],
+    },
+    world_lore: {
+        label: '世界观',
+        singleton: false,
+        keyColumn: 'key',
+        columns: ['key', 'category', 'content'],
     },
 };
 
@@ -407,9 +431,13 @@ function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
         '',
         '## 表结构',
         '- global_state: location(位置), time(时间), scene(场景), atmosphere(氛围)',
-        '- protagonist_info: name(姓名), appearance(外貌), personality(性格), currentState(当前状态)',
-        '- important_characters: name(姓名), role(角色), appearance(外貌), relationship(与主角关系), status(状态)',
+        '- protagonist_info: name(姓名), appearance(外貌描述), personality(性格), currentState(当前状态), background(背景), traits(特征逗号分隔), abilities(能力逗号分隔)',
+        '- user_info: name(姓名), appearance(外貌描述), personality(性格), persona(人设描述)',
+        '- important_characters: name(姓名), role(角色), appearance(外貌描述), relationship(与主角关系), status(状态), traits(特征逗号分隔), lastInteraction(最近互动摘要)',
         '- chronicle: summary(事件摘要≤50字), entities(相关人物逗号分隔), keywords(关键词逗号分隔), importance(0-1浮点)',
+        '- items: name(名称), type(类型如武器/道具/食物), owner(持有者), description(描述), location(所在位置), status(状态如正常/损坏)',
+        '- relationships: relKey(关系键如"A→B"), fromChar(角色A), toChar(角色B), type(关系类型), value(亲密度-1到1), notes(备注)',
+        '- world_lore: key(关键词), category(类别如规则/地点/组织), content(内容描述)',
         '',
         '## 命令格式',
         '将所有命令写在 <tableEdit> 和 </tableEdit> 之间，每行一条：',
@@ -420,16 +448,23 @@ function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
         '</tableEdit>',
         '',
         '## 规则',
-        '1. global_state 和 protagonist_info 始终用 updateRow("表名", "singleton", {...})',
-        '2. important_characters 用角色名作为键值，新角色用 insertRow，已存在用 updateRow',
-        '3. chronicle 只用 insertRow，不需要指定 amCode（自动生成）',
-        '4. summary 必须是简洁的一句话总结（≤50字），不是原文复制',
-        '5. 只提取对后续剧情有持久影响的信息',
+        '1. global_state、protagonist_info、user_info 始终用 updateRow("表名", "singleton", {...})',
+        '2. important_characters、items、world_lore 用名称作为键值，新条目用 insertRow，已存在用 updateRow',
+        '3. relationships 用 relKey 作为键值（格式："A→B"），新关系用 insertRow，已存在用 updateRow',
+        '4. chronicle 只用 insertRow，不需要指定 amCode（自动生成）',
+        '5. 外貌描写必须详细（发型、瞳色、体型、服饰、特征等），不能只写一个词',
+        '6. summary 必须是简洁的一句话总结（≤50字），不是原文复制',
+        '7. 只提取对后续剧情有持久影响的信息',
+        '8. important_characters 必须包含 User 角色（扮演的用户身份，不是 AI 助手）',
         '',
         '## 示例输出',
         '<tableEdit>',
-        'updateRow("global_state", "singleton", {"location":"酒馆二楼","time":"深夜","scene":"密谈"})',
-        'insertRow("important_characters", {"name":"艾莉丝","role":"盟友","appearance":"金发碧眼","relationship":"信任的伙伴","status":"在场"})',
+        'updateRow("global_state", "singleton", {"location":"酒馆二楼","time":"深夜","scene":"密谈","atmosphere":"紧张"})',
+        'updateRow("protagonist_info", "singleton", {"appearance":"银发及腰，紫瞳，身材纤细，穿白色长裙","traits":"冷静,机智","abilities":"魔法感知"})',
+        'insertRow("important_characters", {"name":"艾莉丝","role":"盟友","appearance":"金色短发，碧绿眼眸，精灵耳，穿皮革轻甲","relationship":"信任的伙伴","status":"在场","traits":"勇敢,忠诚"})',
+        'insertRow("items", {"name":"月光匕首","type":"武器","owner":"主角","description":"散发淡蓝光芒的精灵匕首","location":"腰间","status":"正常"})',
+        'insertRow("relationships", {"relKey":"主角→艾莉丝","fromChar":"主角","toChar":"艾莉丝","type":"盟友","value":0.8,"notes":"共同经历了多次冒险"})',
+        'insertRow("world_lore", {"key":"空庭","category":"地点","content":"一个被魔法封锁的异空间，有严格的规则体系"})',
         'insertRow("chronicle", {"summary":"主角与艾莉丝达成秘密协议","entities":"主角,艾莉丝","keywords":"协议,密谋","importance":0.8})',
         '</tableEdit>',
         '',
@@ -464,7 +499,17 @@ function buildTableStateSnapshot(tableData) {
         if (protag.appearance) parts.push(`外貌：${protag.appearance}`);
         if (protag.currentState) parts.push(`状态：${protag.currentState}`);
         if (protag.personality) parts.push(`性格：${protag.personality}`);
+        if (protag.background) parts.push(`背景：${protag.background}`);
+        if (protag.traits) parts.push(`特征：${protag.traits}`);
         if (parts.length) lines.push(`[protagonist_info] ${parts.join(' | ')}`);
+    }
+    const userInfo = tableData.userInfo?.[0];
+    if (userInfo) {
+        const parts = [];
+        if (userInfo.name) parts.push(`姓名：${userInfo.name}`);
+        if (userInfo.appearance) parts.push(`外貌：${userInfo.appearance}`);
+        if (userInfo.persona) parts.push(`人设：${userInfo.persona.slice(0, 100)}`);
+        if (parts.length) lines.push(`[user_info] ${parts.join(' | ')}`);
     }
     if (tableData.characters?.length) {
         for (const c of tableData.characters) {
@@ -472,7 +517,27 @@ function buildTableStateSnapshot(tableData) {
             if (c.role) parts.push(c.role);
             if (c.relationship) parts.push(c.relationship);
             if (c.status) parts.push(c.status);
+            if (c.traits) parts.push(`特征:${c.traits}`);
             lines.push(`[character] ${parts.join(' / ')}`);
+        }
+    }
+    if (tableData.items?.length) {
+        for (const item of tableData.items) {
+            const parts = [item.name];
+            if (item.type) parts.push(item.type);
+            if (item.owner) parts.push(`持有:${item.owner}`);
+            if (item.status) parts.push(item.status);
+            lines.push(`[item] ${parts.join(' / ')}`);
+        }
+    }
+    if (tableData.relationships?.length) {
+        for (const r of tableData.relationships) {
+            lines.push(`[relationship] ${r.relKey}: ${r.type}(${r.value}) ${r.notes || ''}`);
+        }
+    }
+    if (tableData.worldLore?.length) {
+        for (const w of tableData.worldLore) {
+            lines.push(`[world_lore] ${w.key}(${w.category}): ${(w.content || '').slice(0, 60)}`);
         }
     }
     if (tableData.chronicle?.length) {
@@ -527,32 +592,36 @@ async function executeTableCommands(commands) {
 
     for (const cmd of commands) {
         try {
+            const schema = TABLE_SCHEMAS[cmd.table];
+            if (!schema) continue;
+
             if (cmd.action === 'insertRow') {
                 if (cmd.table === 'chronicle') {
                     cmd.data.amCode = `AM${String(nextAmCode++).padStart(4, '0')}`;
                     cmd.data.turn = chat.length;
-                    await putRow('chronicle', cmd.data);
-                } else if (cmd.table === 'important_characters') {
-                    await putRow('important_characters', cmd.data);
                 }
+                await putRow(cmd.table, cmd.data);
                 executed++;
             } else if (cmd.action === 'updateRow') {
-                if (cmd.table === 'global_state' || cmd.table === 'protagonist_info') {
+                if (schema.singleton) {
                     cmd.data._key = 'singleton';
                     await putRow(cmd.table, cmd.data);
-                } else if (cmd.table === 'important_characters') {
-                    const existing = await getTable('important_characters');
-                    const target = existing.find(r => r.name === cmd.keyValue);
+                } else {
+                    const existing = await getTable(cmd.table);
+                    const keyCol = schema.keyColumn;
+                    const target = existing.find(r => r[keyCol] === cmd.keyValue);
                     if (target) {
                         Object.assign(target, cmd.data);
-                        await putRow('important_characters', target);
+                        await putRow(cmd.table, target);
+                    } else {
+                        // Key not found, treat as insert
+                        if (keyCol) cmd.data[keyCol] = cmd.keyValue;
+                        await putRow(cmd.table, cmd.data);
                     }
                 }
                 executed++;
             } else if (cmd.action === 'deleteRow') {
-                if (cmd.table === 'important_characters') {
-                    await deleteRow('important_characters', cmd.keyValue);
-                }
+                await deleteRow(cmd.table, cmd.keyValue);
                 executed++;
             }
         } catch (e) {
@@ -707,8 +776,12 @@ async function runMemoryLlmExtraction({ manual = false } = {}) {
         const tableData = {
             state: await getTable('global_state'),
             protagonist: await getTable('protagonist_info'),
+            userInfo: await getTable('user_info'),
             characters: await getTable('important_characters'),
             chronicle: await getTable('chronicle'),
+            items: await getTable('items'),
+            relationships: await getTable('relationships'),
+            worldLore: await getTable('world_lore'),
         };
         const prompt = buildMemoryExtractionPrompt(turns, worldTerms, tableData);
         const result = settings.memoryLlmProvider === 'direct'
@@ -761,18 +834,29 @@ async function recallStructuredMemory(messages) {
     const protagonist = (await getTable('protagonist_info'))[0] || null;
     const allCharacters = await getTable('important_characters');
     const allChronicle = await getTable('chronicle');
+    const allItems = await getTable('items');
+    const allRelationships = await getTable('relationships');
+    const allWorldLore = await getTable('world_lore');
 
-    // Always inject all characters (stable content for cache prefix)
-    const activeCharacters = allCharacters;
+    // Auto-inject User persona if user_info table is empty
+    let userInfo = (await getTable('user_info'))[0] || null;
+    if (!userInfo && power_user.persona_description) {
+        userInfo = {
+            _key: 'singleton',
+            name: name1 || 'User',
+            persona: power_user.persona_description,
+        };
+        await putRow('user_info', userInfo);
+    }
 
-    // Use top-N by importance (stable ordering, no keyword matching)
+    // Always inject all data (stable content for cache prefix)
     const maxChronicle = Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle);
     const relevantChronicle = [...allChronicle]
         .sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0))
         .slice(0, maxChronicle);
 
     lastRecallResults = relevantChronicle;
-    return { state, protagonist, activeCharacters, relevantChronicle };
+    return { state, protagonist, userInfo, activeCharacters: allCharacters, relevantChronicle, items: allItems, relationships: allRelationships, worldLore: allWorldLore };
 }
 
 function buildStructuredInjection(memory) {
@@ -797,6 +881,20 @@ function buildStructuredInjection(memory) {
         if (p.appearance) parts.push(`外貌：${p.appearance}`);
         if (p.currentState) parts.push(`状态：${p.currentState}`);
         if (p.personality) parts.push(`性格：${p.personality}`);
+        if (p.background) parts.push(`背景：${p.background}`);
+        if (p.traits) parts.push(`特征：${p.traits}`);
+        if (p.abilities) parts.push(`能力：${p.abilities}`);
+        lines.push(parts.join(' | '));
+    }
+
+    if (memory.userInfo) {
+        lines.push('[User角色]');
+        const u = memory.userInfo;
+        const parts = [];
+        if (u.name) parts.push(`${u.name}`);
+        if (u.appearance) parts.push(`外貌：${u.appearance}`);
+        if (u.personality) parts.push(`性格：${u.personality}`);
+        if (u.persona) parts.push(`人设：${u.persona}`);
         lines.push(parts.join(' | '));
     }
 
@@ -807,7 +905,33 @@ function buildStructuredInjection(memory) {
             if (c.relationship) parts.push(c.relationship);
             if (c.status) parts.push(c.status);
             if (c.appearance) parts.push(c.appearance);
+            if (c.traits) parts.push(`特征:${c.traits}`);
             lines.push(`- ${parts.join(' / ')}`);
+        }
+    }
+
+    if (memory.items?.length) {
+        lines.push('[物品]');
+        for (const item of memory.items) {
+            const parts = [item.name];
+            if (item.type) parts.push(item.type);
+            if (item.owner) parts.push(`持有:${item.owner}`);
+            if (item.status) parts.push(item.status);
+            lines.push(`- ${parts.join(' / ')}`);
+        }
+    }
+
+    if (memory.relationships?.length) {
+        lines.push('[关系]');
+        for (const r of memory.relationships) {
+            lines.push(`- ${r.relKey}: ${r.type}(${r.value})${r.notes ? ' ' + r.notes : ''}`);
+        }
+    }
+
+    if (memory.worldLore?.length) {
+        lines.push('[世界观]');
+        for (const w of memory.worldLore) {
+            lines.push(`- ${w.key}(${w.category}): ${w.content}`);
         }
     }
 
@@ -1905,8 +2029,8 @@ async function openPanel(activeTab = 'optimizer') {
                         <div class="dco-card-title">活跃角色</div>
                         <div class="dco-table-wrap">
                             <table class="dco-table">
-                                <thead><tr><th>姓名</th><th>角色</th><th>外貌</th><th>关系</th><th>状态</th></tr></thead>
-                                <tbody id="dco_characters_rows"><tr><td colspan="5">暂无数据。</td></tr></tbody>
+                                <thead><tr><th>姓名</th><th>角色</th><th>外貌</th><th>关系</th><th>状态</th><th>特征</th></tr></thead>
+                                <tbody id="dco_characters_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
@@ -1916,6 +2040,33 @@ async function openPanel(activeTab = 'optimizer') {
                             <table class="dco-table">
                                 <thead><tr><th>编号</th><th>事件摘要</th><th>相关人物</th><th>关键词</th><th>轮次</th><th>重要性</th></tr></thead>
                                 <tbody id="dco_chronicle_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">物品</div>
+                        <div class="dco-table-wrap">
+                            <table class="dco-table">
+                                <thead><tr><th>名称</th><th>类型</th><th>持有者</th><th>描述</th><th>位置</th><th>状态</th></tr></thead>
+                                <tbody id="dco_items_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">关系</div>
+                        <div class="dco-table-wrap">
+                            <table class="dco-table">
+                                <thead><tr><th>关系键</th><th>角色A</th><th>角色B</th><th>类型</th><th>亲密度</th><th>备注</th></tr></thead>
+                                <tbody id="dco_relationships_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">世界观</div>
+                        <div class="dco-table-wrap">
+                            <table class="dco-table">
+                                <thead><tr><th>关键词</th><th>类别</th><th>内容</th></tr></thead>
+                                <tbody id="dco_world_lore_rows"><tr><td colspan="3">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
@@ -2008,8 +2159,12 @@ async function openPanel(activeTab = 'optimizer') {
         try {
             const state = (await getTable('global_state'))[0];
             const protagonist = (await getTable('protagonist_info'))[0];
+            const userInfo = (await getTable('user_info'))[0];
             const characters = await getTable('important_characters');
             const chronicle = await getTable('chronicle');
+            const items = await getTable('items');
+            const relationships = await getTable('relationships');
+            const worldLore = await getTable('world_lore');
 
             const stateSummary = [];
             if (state) {
@@ -2022,14 +2177,28 @@ async function openPanel(activeTab = 'optimizer') {
                 if (protagonist.name) stateSummary.push(`角色：${escapeHtml(protagonist.name)}`);
                 if (protagonist.appearance) stateSummary.push(`外貌：${escapeHtml(protagonist.appearance)}`);
                 if (protagonist.currentState) stateSummary.push(`状态：${escapeHtml(protagonist.currentState)}`);
+                if (protagonist.traits) stateSummary.push(`特征：${escapeHtml(protagonist.traits)}`);
+            }
+            if (userInfo) {
+                if (userInfo.name) stateSummary.push(`User：${escapeHtml(userInfo.name)}`);
+                if (userInfo.persona) stateSummary.push(`人设：${escapeHtml(userInfo.persona.slice(0, 80))}`);
             }
             html.find('#dco_table_state_summary').text(stateSummary.length ? stateSummary.join(' | ') : '暂无数据。');
 
             if (characters.length) {
-                html.find('#dco_characters_rows').html(characters.map(c => `<tr><td>${escapeHtml(c.name || '')}</td><td>${escapeHtml(c.role || '')}</td><td>${escapeHtml(c.appearance || '')}</td><td>${escapeHtml(c.relationship || '')}</td><td>${escapeHtml(c.status || '')}</td></tr>`).join(''));
+                html.find('#dco_characters_rows').html(characters.map(c => `<tr><td>${escapeHtml(c.name || '')}</td><td>${escapeHtml(c.role || '')}</td><td>${escapeHtml(c.appearance || '')}</td><td>${escapeHtml(c.relationship || '')}</td><td>${escapeHtml(c.status || '')}</td><td>${escapeHtml(c.traits || '')}</td></tr>`).join(''));
             }
             if (chronicle.length) {
                 html.find('#dco_chronicle_rows').html(chronicle.map(e => `<tr><td>${escapeHtml(e.amCode || '')}</td><td>${escapeHtml(e.summary || '')}</td><td>${escapeHtml(e.entities || '')}</td><td>${escapeHtml(e.keywords || '')}</td><td>${e.turn || ''}</td><td>${Number(e.importance || 0).toFixed(2)}</td></tr>`).join(''));
+            }
+            if (items.length) {
+                html.find('#dco_items_rows').html(items.map(i => `<tr><td>${escapeHtml(i.name || '')}</td><td>${escapeHtml(i.type || '')}</td><td>${escapeHtml(i.owner || '')}</td><td>${escapeHtml(i.description || '')}</td><td>${escapeHtml(i.location || '')}</td><td>${escapeHtml(i.status || '')}</td></tr>`).join(''));
+            }
+            if (relationships.length) {
+                html.find('#dco_relationships_rows').html(relationships.map(r => `<tr><td>${escapeHtml(r.relKey || '')}</td><td>${escapeHtml(r.fromChar || '')}</td><td>${escapeHtml(r.toChar || '')}</td><td>${escapeHtml(r.type || '')}</td><td>${r.value ?? ''}</td><td>${escapeHtml(r.notes || '')}</td></tr>`).join(''));
+            }
+            if (worldLore.length) {
+                html.find('#dco_world_lore_rows').html(worldLore.map(w => `<tr><td>${escapeHtml(w.key || '')}</td><td>${escapeHtml(w.category || '')}</td><td>${escapeHtml(w.content || '')}</td></tr>`).join(''));
             }
         } catch (e) {
             console.warn('[DeepSeek Cache Optimizer] Failed to load table data for panel', e);
@@ -2099,8 +2268,8 @@ function renderSettings() {
             <div class="inline-drawer-content">
                 <button id="dco_open_panel" class="menu_button dco-full-btn">打开控制面板</button>
                 <div class="dco-update-row">
-                    <button id="dco_check_update" class="menu_button">检查更新</button>
-                    <button id="dco_update_extension" class="menu_button">更新扩展</button>
+                    <button id="dco_check_update" class="menu_button"><i class="fa-solid fa-rotate"></i> 检查更新</button>
+                    <button id="dco_update_extension" class="menu_button"><i class="fa-solid fa-download"></i> 更新扩展</button>
                 </div>
                 <div id="dco_update_status" class="dco-muted">${escapeHtml(getUpdateStatusText())}</div>
                 <details class="dco-section" open>
