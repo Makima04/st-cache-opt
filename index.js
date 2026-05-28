@@ -20,6 +20,7 @@ import {
 } from '../../world-info.js';
 
 const MODULE_NAME = 'deepseek_cache_optimizer';
+const EXTENSION_FOLDER_NAME = 'st-cache-opt';
 
 const defaultSettings = {
     enabled: true,
@@ -148,7 +149,6 @@ let lastStats = {
 let previousSerializedPrompt = '';
 let previousHistoryOnlySerialized = '';
 let previousMessageSignatures = [];
-let lastRequestSnapshot = null;
 let lastBackendUsage = null;
 let lastGenerationSettings = null;
 let usageHistory = [];
@@ -159,6 +159,8 @@ let lastPromptAnalysis = [];
 let memoryExtractorRunning = false;
 let memoryExtractorStatus = '尚未运行';
 let lastMemoryExtractorResult = null;
+let lastUpdateCheck = null;
+let updateRunning = false;
 
 const promptCategoryLabels = {
     stable_rule: '稳定规则',
@@ -483,7 +485,7 @@ function buildTableStateSnapshot(tableData) {
 
 function parseTableCommands(llmOutput) {
     // Normalize curly quotes to straight quotes
-    const normalized = llmOutput.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    const normalized = llmOutput.replace(/[“”]/g, '"').replace(/[‘’]/g, '\'');
     // First try to extract from <tableEdit>...</tableEdit> tags
     const tagMatch = normalized.match(/<tableEdit>([\s\S]*?)<\/tableEdit>/i);
     const searchText = tagMatch ? tagMatch[1] : normalized;
@@ -1208,22 +1210,6 @@ function isRichFormatMessage(message) {
         || richFormatPatterns.some(pattern => pattern.test(text));
 }
 
-function getFirstHistoryIndex(messages) {
-    const index = messages.findIndex(message => {
-        if (!message || message.injected) {
-            return false;
-        }
-
-        if (message.role === 'user' || message.role === 'assistant' || message.role === 'tool') {
-            return true;
-        }
-
-        return Boolean(message.tool_calls || message.tool_call_id);
-    });
-
-    return index === -1 ? messages.length : index;
-}
-
 function getLatestUserMessageIndex(messages) {
     for (let index = messages.length - 1; index >= 0; index--) {
         if (messages[index]?.role === 'user' && !isHardDynamicMessage(messages[index]) && !isHistoryMarkerMessage(messages[index])) {
@@ -1416,14 +1402,6 @@ async function optimizeChatCompletionPrompt(eventData) {
         localStorage.setItem('dco_prevSerialized', serializedPrompt);
         localStorage.setItem('dco_prevHistorySerialized', historyOnlySerialized);
     } catch { /* quota exceeded or unavailable */ }
-    lastRequestSnapshot = {
-        at: new Date(),
-        messages: eventData.chat,
-        serializedPrompt,
-        messageSignatures,
-        stats: structuredClone(lastStats),
-    };
-
     if (settings.debug) {
         console.debug('[DeepSeek Cache Optimizer]', lastStats, eventData.chat);
     }
@@ -1464,6 +1442,7 @@ function updateStats() {
         `动态块后移：${lastStats.dynamicMoved || 0} 条`,
         `本地记忆：本轮召回 ${lastRecallResults.length} 条`,
         `记忆抽取：${memoryExtractorStatus}`,
+        `扩展更新：${getUpdateStatusText()}`,
         '',
         getBackendUsageText(),
         firstChangedText.trim(),
@@ -1479,6 +1458,13 @@ function updateStats() {
         extractorBtn.prop('disabled', memoryExtractorRunning);
         extractorBtn.text(memoryExtractorRunning ? '运行中...' : '运行记忆抽取');
     }
+
+    const updateStatus = $('#dco_update_status');
+    if (updateStatus.length) {
+        updateStatus.text(getUpdateStatusText());
+    }
+    $('#dco_update_extension').prop('disabled', updateRunning);
+    $('#dco_check_update').prop('disabled', updateRunning);
 }
 
 function getTokenEstimateText() {
@@ -1532,6 +1518,109 @@ function getAnalysisRows(limit = 80) {
                 <td class="dco-preview">${escapeHtml(item.preview || '')}</td>
             </tr>
         `).join('');
+}
+
+async function callExtensionUpdateApi(endpoint, { global = false } = {}) {
+    const response = await fetch(`/api/extensions/${endpoint}`, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            extensionName: EXTENSION_FOLDER_NAME,
+            global,
+        }),
+    });
+
+    const text = await response.text();
+    let data = null;
+    try {
+        data = text ? JSON.parse(text) : null;
+    } catch {
+        data = null;
+    }
+
+    if (!response.ok) {
+        throw new Error(text || response.statusText || '扩展更新接口请求失败');
+    }
+
+    return data;
+}
+
+function formatCommit(value) {
+    return value ? String(value).slice(0, 7) : '未知';
+}
+
+async function checkSelfUpdate({ quiet = false } = {}) {
+    try {
+        const data = await callExtensionUpdateApi('version');
+        lastUpdateCheck = {
+            at: new Date(),
+            ...data,
+        };
+        const status = data?.isUpToDate === false
+            ? `发现更新：当前 ${formatCommit(data.currentCommitHash)}，远程有新提交。`
+            : `已是最新：${formatCommit(data?.currentCommitHash)}。`;
+        if (!quiet) {
+            (data?.isUpToDate === false ? toastr.info : toastr.success)(status);
+        }
+        updateStats();
+        return data;
+    } catch (error) {
+        lastUpdateCheck = { at: new Date(), error: error.message || String(error) };
+        if (!quiet) {
+            toastr.error(`检查更新失败：${lastUpdateCheck.error}`);
+        }
+        updateStats();
+        return null;
+    }
+}
+
+async function updateSelfExtension() {
+    if (updateRunning) {
+        return;
+    }
+
+    updateRunning = true;
+    updateStats();
+
+    try {
+        const data = await callExtensionUpdateApi('update');
+        lastUpdateCheck = {
+            at: new Date(),
+            ...data,
+        };
+        if (data?.isUpToDate) {
+            toastr.success(`扩展已是最新：${formatCommit(data.shortCommitHash)}`);
+        } else {
+            toastr.success(`扩展已更新到 ${formatCommit(data.shortCommitHash)}，请刷新页面生效。`);
+        }
+    } catch (error) {
+        lastUpdateCheck = { at: new Date(), error: error.message || String(error) };
+        toastr.error(`更新失败：${lastUpdateCheck.error}`);
+    } finally {
+        updateRunning = false;
+        updateStats();
+    }
+}
+
+function getUpdateStatusText() {
+    if (updateRunning) {
+        return '正在更新扩展...';
+    }
+
+    if (!lastUpdateCheck) {
+        return '尚未检查。';
+    }
+
+    if (lastUpdateCheck.error) {
+        return `上次检查失败：${lastUpdateCheck.error}`;
+    }
+
+    const time = lastUpdateCheck.at?.toLocaleString?.() || '未知时间';
+    const branch = lastUpdateCheck.currentBranchName || '未知分支';
+    const commit = formatCommit(lastUpdateCheck.currentCommitHash || lastUpdateCheck.shortCommitHash);
+    const remote = lastUpdateCheck.remoteUrl ? `；来源：${lastUpdateCheck.remoteUrl}` : '';
+    const state = lastUpdateCheck.isUpToDate === false ? '有可用更新' : '已是最新';
+    return `${state}；${branch}-${commit}；检查时间：${time}${remote}`;
 }
 
 async function fetchExtractorModels(settings) {
@@ -2009,6 +2098,11 @@ function renderSettings() {
             </div>
             <div class="inline-drawer-content">
                 <button id="dco_open_panel" class="menu_button dco-full-btn">打开控制面板</button>
+                <div class="dco-update-row">
+                    <button id="dco_check_update" class="menu_button">检查更新</button>
+                    <button id="dco_update_extension" class="menu_button">更新扩展</button>
+                </div>
+                <div id="dco_update_status" class="dco-muted">${escapeHtml(getUpdateStatusText())}</div>
                 <details class="dco-section" open>
                     <summary class="dco-section-title">缓存优化</summary>
                     <label class="checkbox_label dco-inline" for="dco_enabled">
@@ -2057,6 +2151,8 @@ function renderSettings() {
 
     $('#extensions_settings2').append(html);
     $('#dco_open_panel').on('click', () => openPanel());
+    $('#dco_check_update').on('click', () => checkSelfUpdate());
+    $('#dco_update_extension').on('click', () => updateSelfExtension());
     bindSettings();
 }
 
@@ -2072,7 +2168,7 @@ export function init() {
         lastRecallResults = [];
         previousSerializedPrompt = '';
         previousHistoryOnlySerialized = '';
-        try { localStorage.removeItem('dco_prevSerialized'); localStorage.removeItem('dco_prevHistorySerialized'); } catch {}
+        try { localStorage.removeItem('dco_prevSerialized'); localStorage.removeItem('dco_prevHistorySerialized'); } catch { /* localStorage unavailable */ }
     });
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
         runMemoryLlmExtraction().catch(error => console.warn('[DeepSeek Cache Optimizer] Failed to run memory extraction', error));

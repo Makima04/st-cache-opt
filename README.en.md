@@ -14,6 +14,12 @@ https://github.com/Makima04/st-cache-opt
 
 After installation, reload the browser tab and enable `DeepSeek 缓存优化器` in Extensions.
 
+## Update
+
+If you installed this extension with SillyTavern's extension installer, use `检查更新` / `更新扩展` inside the extension panel. Reload the page after an update.
+
+If you installed it manually, download the repository again and overwrite the old files.
+
 ## Manual install
 
 Copy this repository folder to:
@@ -110,4 +116,3 @@ The extractor expects JSON with:
 ```
 
 Direct API keys are stored in extension settings in the browser. For shared or public deployments, prefer the SillyTavern backend mode.
-
