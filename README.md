@@ -1,101 +1,113 @@
 # ST Cache Opt / DeepSeek 缓存优化器
 
-SillyTavern native extension for DeepSeek/NewAPI prompt cache optimization.
+中文 | [English](README.en.md)
 
-## Install from SillyTavern
+SillyTavern 原生扩展，用于优化 DeepSeek / NewAPI 的 Prompt 缓存命中率。
 
-Use SillyTavern's built-in extension installer and enter this repository URL:
+## 从 SillyTavern 安装
+
+在 SillyTavern 的扩展安装器中输入本仓库地址：
 
 ```text
 https://github.com/Makima04/st-cache-opt
 ```
 
-After installation, reload the browser tab and enable `DeepSeek 缓存优化器` in Extensions.
+安装完成后刷新浏览器页面，并在扩展面板中启用 `DeepSeek 缓存优化器`。
 
-## Manual install
+## 手动安装
 
-Copy this repository folder to:
+将本仓库文件夹复制到：
 
 ```text
 SillyTavern/public/scripts/extensions/st-cache-opt
 ```
 
-Restart SillyTavern or reload the browser tab.
+然后重启 SillyTavern 或刷新浏览器页面。
 
-## What it does
+## 功能
 
-The extension listens to `CHAT_COMPLETION_PROMPT_READY`, after SillyTavern has expanded presets, character fields, world info, examples, and chat history into OpenAI-compatible `messages`.
+扩展会监听 `CHAT_COMPLETION_PROMPT_READY`。此时 SillyTavern 已经把预设、角色卡、世界书、示例对话和聊天历史展开成 OpenAI-compatible `messages`。
 
-It then runs a local Prompt Analyzer and reorders movable pre-history blocks for the current request:
+扩展会运行本地 Prompt Analyzer，并只重排当前请求中可安全移动的历史前块：
 
-- stable character/preset prompts first
-- stable role/world/format rules next
-- variable update schema before variable values
-- dynamic state, local recall, and current variables later
-- chat history and the latest user message stay in their semantic position
+- 稳定角色卡和预设尽量前置
+- 稳定规则、世界设定、格式规则靠前
+- 变量更新规则放在变量值之前
+- 当前状态、本地召回、动态变量值尽量后移
+- 聊天历史和最新用户输入保持语义位置
 
-It does not modify saved presets, world books, character cards, or chat history.
+扩展不会修改已保存的预设、世界书、角色卡或聊天记录。
 
-## Rich format / front-end cards
+## 富格式 / 前端角色卡保护
 
-Some character cards include HTML/CSS panels, diaries, stat screens, `<details>` blocks, or Markdown code fences that render as a front-end page. These blocks should be treated as atomic content.
+部分角色卡会包含 HTML/CSS 面板、日记、状态栏、`<details>` 块或 Markdown 代码块。这类内容应该视为一个整体。
 
-The `Protect rich HTML/CSS message blocks` option detects likely rich-format blocks and pins them in place. The optimizer will not split, merge, summarize, or move those blocks independently.
+`保护 HTML/CSS 富格式消息块` 选项会检测这类内容，并将其原位保护。优化器不会拆分、合并、总结或单独移动这些块。
 
-For best results, keep the whole UI block in one message or one world info entry. Avoid mixing a large HTML/CSS panel with unrelated lore text in the same entry.
+建议把完整 UI 块放在同一条消息或同一个世界书条目中，避免把大型 HTML/CSS 页面和无关设定混在同一个条目里。
 
-## Why
+## 为什么能提高缓存命中
 
-DeepSeek context cache hits require a stable token prefix. In SillyTavern, world info and extension prompts can appear before stable character information, which can cause a small change in activated lore to invalidate the remaining prefix. Moving stable content earlier improves the chance that DeepSeek can reuse cached prefix tokens.
+DeepSeek 的上下文缓存依赖稳定 token 前缀。SillyTavern 中，世界书、扩展提示词和动态状态有时会排在稳定角色设定之前，导致一点世界书激活变化就让后续大段前缀失效。
 
-## Notes
+本扩展的目标是把更稳定的内容放到更靠前的位置，把频繁变化的内容放到稳定前缀之后，从而提高 DeepSeek 复用缓存前缀的概率。
 
-The default setting only runs when Chat Completion source is DeepSeek. Use `Debug log reordered messages` to inspect the final message order in the browser console.
+## 后端 usage 与真实缓存 tokens
 
-## Backend usage
+面板可以显示后端 `usage`，但前提是 SillyTavern 或上游能返回并暴露该字段。
 
-The panel can show backend `usage` when SillyTavern emits `CHAT_COMPLETION_RESPONSE_USAGE`.
+OpenAI-compatible / NewAPI 常见情况：
 
-For OpenAI-compatible NewAPI routes:
+- 非流式响应通常直接包含 `usage`
+- 流式响应通常需要发送 `stream_options: { include_usage: true }`
+- 缓存命中常见字段是 `usage.prompt_tokens_details.cached_tokens`
+- 部分中转使用 `usage.prompt_cache_hit_tokens` / `usage.prompt_cache_miss_tokens`
 
-- non-stream responses normally include `usage`
-- stream responses need `stream_options: { include_usage: true }`
-- cache hits are commonly reported as `usage.prompt_tokens_details.cached_tokens`
-- some gateways use `usage.prompt_cache_hit_tokens` and `usage.prompt_cache_miss_tokens`
+本地共同前缀诊断是字符级估算，只用于判断稳定趋势。真实计费 token 和缓存命中以模型后台或 `usage` 为准。
 
-The local prefix diagnostics are character-based and are only a cache-stability hint. Backend `usage` remains the authority for billing tokens and cache hits.
+## 无向量本地记忆召回
 
-## Local memory recall without vectors
+0.5 版本加入了可选的浏览器本地记忆召回层，默认关闭。
 
-Version 0.5 adds an optional browser-local memory recall layer. It is off by default.
+启用后，扩展会将当前角色/聊天的紧凑记忆记录存入 IndexedDB。它不会修改 SillyTavern 的聊天文件、预设、世界书或角色卡。
 
-When enabled, the extension stores compact memory records for the current character/chat in IndexedDB. It does not modify SillyTavern chat files, presets, world books, or character cards.
+召回依据包括：
 
-Recall uses:
+- 角色名和世界书 key 的实体匹配
+- 聊天文本关键词匹配
+- 世界书 key / 引用匹配
+- 记忆类型优先级、重要度和近因权重
 
-- exact entity matches from character names and world book keys
-- keyword matches from message text
-- world book key/reference matches
-- memory type priority, importance, and recency
-
-The recalled block is inserted as a short system message before chat history:
+召回块会作为较短的 system message 插入到聊天历史之前：
 
 ```text
 [长期记忆召回]
 - event / 第42轮 / 相关度8.5: ...
 ```
 
-For cache stability, keep recalled item count and character budget small. The dynamic memory block is inserted after the stable prompt prefix, so the stable prefix can still hit cache.
+为了保持缓存稳定，建议控制召回条数和字符上限。动态记忆块会插入在稳定 Prompt 前缀之后。
 
-## LLM memory extraction
+## 独立 LLM 记忆抽取
 
-The extension can optionally use a separate LLM to extract structured memories:
+扩展可以使用单独的 LLM 做结构化长期记忆抽取：
 
-- default mode reuses SillyTavern's backend connection and stored API key
-- direct mode lets the user enter an OpenAI-compatible API URL, API key, and model
-- extracted records are stored in browser IndexedDB
-- recall remains local and deterministic; the chat generation model is not used for background extraction
+- 默认模式复用 SillyTavern 后端连接和已保存 API key
+- 直接模式允许用户填写 OpenAI-compatible API URL、API key 和模型名
+- 抽取结果存储在浏览器 IndexedDB
+- 召回仍然是本地确定性逻辑；聊天正文模型不会被用于后台记忆抽取
 
-The extractor expects JSON with `events`, `states`, `goals`, `relationships`, `rules`, and `obsolete_memory_ids`.
+抽取器期望 JSON 包含：
 
-Direct API keys are stored in extension settings in the browser. For shared or public deployments, prefer the SillyTavern backend mode.
+```json
+{
+  "events": [],
+  "states": [],
+  "goals": [],
+  "relationships": [],
+  "rules": [],
+  "obsolete_memory_ids": []
+}
+```
+
+直接填写的 API key 会保存在浏览器扩展设置中。多人或公网部署时，建议优先使用复用 SillyTavern 后端密钥的模式。
+
