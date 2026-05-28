@@ -1,0 +1,14 @@
+{
+    "display_name": "DeepSeek 缓存优化器",
+    "loading_order": 999,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Makim",
+    "version": "0.5.0",
+    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "hooks": {
+        "activate": "init"
+    }
+}
