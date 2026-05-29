@@ -23,8 +23,10 @@ import { getGroupNames } from '/scripts/group-chats.js';
 
 const MODULE_NAME = 'deepseek_cache_optimizer';
 const EXTENSION_FOLDER_NAME = 'st-cache-opt';
+const SETTINGS_VERSION = 1;
 
 const defaultSettings = {
+    settingsVersion: SETTINGS_VERSION,
     enabled: true,
     strategy: 'balanced',
     moveWorldInfoAfter: true,
@@ -33,8 +35,11 @@ const defaultSettings = {
     protectRichFormat: true,
     minPrefixMessages: 2,
     debug: false,
+    diagnosticsEnabled: false,
+    recordRequestHistory: false,
+    mergedDiagnostics: false,
     memoryEnabled: false,
-    memoryInject: true,
+    memoryInject: false,
     memoryMaxChronicle: 10,
     memoryMaxCharacters: 6,
     memoryMaxItems: 6,
@@ -216,6 +221,11 @@ const promptCategoryLabels = {
 function getSettings() {
     if (!extension_settings[MODULE_NAME]) {
         extension_settings[MODULE_NAME] = {};
+    }
+
+    if (extension_settings[MODULE_NAME].settingsVersion !== SETTINGS_VERSION) {
+        extension_settings[MODULE_NAME] = { ...defaultSettings };
+        saveSettingsDebounced();
     }
 
     for (const [key, value] of Object.entries(defaultSettings)) {
@@ -1479,6 +1489,11 @@ function makeRequestRecord({ messages, stats, analysis, serializedPrompt, merged
 }
 
 function rememberRequestRecord(record) {
+    const settings = getSettings();
+    if (!settings.diagnosticsEnabled || !settings.recordRequestHistory) {
+        return;
+    }
+
     requestHistory.unshift(record);
     requestHistory = requestHistory.slice(0, 50);
     saveSnapshotToDb(record);
@@ -2444,6 +2459,7 @@ function reorderWithAnalyzer(messages, settings) {
 
 async function optimizeChatCompletionPrompt(eventData) {
     const settings = getSettings();
+    const diagnosticsEnabled = Boolean(settings.diagnosticsEnabled);
 
     if (eventData?.dryRun) {
         return;
@@ -2455,8 +2471,8 @@ async function optimizeChatCompletionPrompt(eventData) {
         return;
     }
 
-    // Serialize raw content (before plugin modifications) for prefix comparison
-    const rawContentBefore = serializeRawContent(eventData.chat);
+    // Serialize raw content only when diagnostics are enabled; this can be large.
+    const rawContentBefore = diagnosticsEnabled ? serializeRawContent(eventData.chat) : '';
 
     promptRunCounter += 1;
 
@@ -2484,7 +2500,9 @@ async function optimizeChatCompletionPrompt(eventData) {
         totalProtected = result.protected;
         lastPromptAnalysis = result.analysis || eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
     } else {
-        lastPromptAnalysis = eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
+        lastPromptAnalysis = diagnosticsEnabled
+            ? eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat))
+            : [];
     }
 
     // --- Merge-aware stability (calls server /process endpoint) ---
@@ -2496,7 +2514,7 @@ async function optimizeChatCompletionPrompt(eventData) {
     let mergedMessagePrefixCount = null;
     let mergedFirstChangedMessage = null;
 
-    if (mergeAwareAvailable) {
+    if (diagnosticsEnabled && settings.mergedDiagnostics && mergeAwareAvailable) {
         mergedMessages = await fetchMergedMessages(eventData.chat);
         if (mergedMessages) {
             mergedContentAfter = serializeMessagesAsJson(mergedMessages);
@@ -2520,32 +2538,32 @@ async function optimizeChatCompletionPrompt(eventData) {
         }
     }
 
-    const serializedPrompt = eventData.chat.map(serializeMessage).join('\n');
-    const rawContentAfter = serializeRawContent(eventData.chat);
-    const messageSignatures = getMessageSignatures(eventData.chat);
+    const serializedPrompt = diagnosticsEnabled ? eventData.chat.map(serializeMessage).join('\n') : '';
+    const rawContentAfter = diagnosticsEnabled ? serializeRawContent(eventData.chat) : '';
+    const messageSignatures = diagnosticsEnabled ? getMessageSignatures(eventData.chat) : [];
 
     // Raw input prefix: ST natural stability (current raw vs previous raw)
-    const rawInputChars = previousRawInput
+    const rawInputChars = diagnosticsEnabled && previousRawInput
         ? getCommonPrefixLength(previousRawInput, rawContentBefore)
         : 0;
-    const rawInputPercent = previousRawInput
+    const rawInputPercent = diagnosticsEnabled && previousRawInput
         ? Math.round((rawInputChars / Math.max(rawContentBefore.length, 1)) * 10000) / 100
         : 0;
 
     // Final prefix: actual cache metric (current final vs previous final)
-    const rawPrefixChars = previousRawContent
+    const rawPrefixChars = diagnosticsEnabled && previousRawContent
         ? getCommonPrefixLength(previousRawContent, rawContentAfter)
         : 0;
-    const rawPrefixPercent = previousRawContent
+    const rawPrefixPercent = diagnosticsEnabled && previousRawContent
         ? Math.round((rawPrefixChars / Math.max(rawContentAfter.length, 1)) * 10000) / 100
         : 0;
 
     // Plugin impact: how much the plugin breaks the prefix
-    const pluginImpact = previousRawContent
+    const pluginImpact = diagnosticsEnabled && previousRawContent
         ? Math.round((rawInputPercent - rawPrefixPercent) * 100) / 100
         : 0;
 
-    const firstChangedMessage = previousMessageSignatures.length
+    const firstChangedMessage = diagnosticsEnabled && previousMessageSignatures.length
         ? getFirstChangedMessage(messageSignatures, previousMessageSignatures)
         : null;
     const stableMessagePrefixCount = Number.isInteger(firstChangedMessage) ? firstChangedMessage : messageSignatures.length;
@@ -2580,26 +2598,30 @@ async function optimizeChatCompletionPrompt(eventData) {
         mergedTotalMessages: mergedMessages?.length ?? null,
     };
 
-    previousSerializedPrompt = serializedPrompt;
-    previousRawContent = rawContentAfter;
-    previousRawInput = rawContentBefore;
-    previousMessageSignatures = messageSignatures;
-    try {
-        localStorage.setItem('dco_prevRawContent', rawContentAfter);
-        localStorage.setItem('dco_prevRawInput', rawContentBefore);
-    } catch { /* quota exceeded */ }
+    if (diagnosticsEnabled) {
+        previousSerializedPrompt = serializedPrompt;
+        previousRawContent = rawContentAfter;
+        previousRawInput = rawContentBefore;
+        previousMessageSignatures = messageSignatures;
+        try {
+            localStorage.setItem('dco_prevRawContent', rawContentAfter);
+            localStorage.setItem('dco_prevRawInput', rawContentBefore);
+        } catch { /* quota exceeded */ }
+    }
     if (mergedMessages) {
         previousMergedContent = mergedContentAfter;
         previousMergedSignatures = mergedSignatures;
         try { localStorage.setItem('dco_prevMergedContent', mergedContentAfter); } catch {}
     }
-    rememberRequestRecord(makeRequestRecord({
-        messages: eventData.chat,
-        stats: lastStats,
-        analysis: lastPromptAnalysis,
-        serializedPrompt,
-        mergedMessages,
-    }));
+    if (diagnosticsEnabled && settings.recordRequestHistory) {
+        rememberRequestRecord(makeRequestRecord({
+            messages: eventData.chat,
+            stats: lastStats,
+            analysis: lastPromptAnalysis,
+            serializedPrompt,
+            mergedMessages,
+        }));
+    }
     if (settings.debug) {
         console.debug('[DeepSeek Cache Optimizer]', lastStats, eventData.chat);
     }
@@ -2903,24 +2925,27 @@ async function openPanel(activeTab = 'optimizer') {
 
     const stats = lastStats;
     const usageMetrics = getBackendUsageMetrics();
-    const analysisRows = getAnalysisRows();
-    const historyRows = getHistoryRows();
+    const diagnosticsEnabled = Boolean(settings.diagnosticsEnabled);
+    const analysisRows = diagnosticsEnabled ? getAnalysisRows() : '';
+    const historyRows = diagnosticsEnabled ? getHistoryRows() : '';
     const rawUsage = lastBackendUsage?.usage ? JSON.stringify(lastBackendUsage.usage, null, 2) : '';
     const defaultCompare = getDefaultCompareIds();
-    const compareReport = getMessageDiffReport(defaultCompare.leftId, defaultCompare.rightId);
-    const requestOptionsLeft = getRequestOptionRows(defaultCompare.leftId);
-    const requestOptionsRight = getRequestOptionRows(defaultCompare.rightId);
-    try {
-        await refreshBackendBodyRecords();
-    } catch (error) {
-        console.warn('[DeepSeek Cache Optimizer] Failed to refresh backend body records', error);
+    const compareReport = diagnosticsEnabled ? getMessageDiffReport(defaultCompare.leftId, defaultCompare.rightId) : '请求诊断未启用。';
+    const requestOptionsLeft = diagnosticsEnabled ? getRequestOptionRows(defaultCompare.leftId) : '';
+    const requestOptionsRight = diagnosticsEnabled ? getRequestOptionRows(defaultCompare.rightId) : '';
+    if (diagnosticsEnabled && activeTab === 'compare') {
+        try {
+            await refreshBackendBodyRecords();
+        } catch (error) {
+            console.warn('[DeepSeek Cache Optimizer] Failed to refresh backend body records', error);
+        }
     }
     const defaultBodyCompare = getDefaultBackendBodyCompareIds();
-    const bodyCompareReport = getBackendBodyDiffReport(defaultBodyCompare.leftId, defaultBodyCompare.rightId);
-    const bodyOptionsLeft = getBackendBodyOptionRows(defaultBodyCompare.leftId);
-    const bodyOptionsRight = getBackendBodyOptionRows(defaultBodyCompare.rightId);
-    const backendBodyRows = getBackendBodyRows();
-    const extractorModels = await fetchExtractorModels(settings);
+    const bodyCompareReport = diagnosticsEnabled ? getBackendBodyDiffReport(defaultBodyCompare.leftId, defaultBodyCompare.rightId) : '请求诊断未启用。';
+    const bodyOptionsLeft = diagnosticsEnabled ? getBackendBodyOptionRows(defaultBodyCompare.leftId) : '';
+    const bodyOptionsRight = diagnosticsEnabled ? getBackendBodyOptionRows(defaultBodyCompare.rightId) : '';
+    const backendBodyRows = diagnosticsEnabled ? getBackendBodyRows() : '';
+    const extractorModels = activeTab === 'memory' && settings.memoryLlmEnabled ? await fetchExtractorModels(settings) : [];
     const currentModel = String(settings.memoryLlmModel || '').trim();
     const useManualMode = currentModel && !extractorModels.includes(currentModel);
     const modelOptions = extractorModels.map(m => `<option value="${escapeHtml(m)}" ${m === currentModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('');
@@ -2944,7 +2969,7 @@ async function openPanel(activeTab = 'optimizer') {
                             <div class="dco-card-title">规则区</div>
                             <label class="checkbox_label dco-inline" for="dco_modal_enabled">
                                 <input id="dco_modal_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''} />
-                                <span>启用 Prompt 消息重排（关闭后仅保留记忆注入）</span>
+                                <span>启用 Prompt 消息重排</span>
                             </label>
                             <div id="dco_reorder_options" ${settings.enabled ? '' : 'style="display:none"'}>
                                 <label class="checkbox_label dco-inline" for="dco_modal_protect">
@@ -2982,6 +3007,7 @@ async function openPanel(activeTab = 'optimizer') {
                                 <div class="dco-metric${stats.pluginImpact > 3 ? ' warn' : ' success'}"><span>插件影响</span><b>${stats.pluginImpact || 0}%</b></div>
                             </div>
                             <pre class="dco-diagnostics dco-modal-diagnostics">${$('#dco_diagnostics').text() || '暂无请求记录。'}</pre>
+                            ${!settings.diagnosticsEnabled ? '<div class="dco-muted">请求诊断未启用：跳过完整 Prompt 分析、后端合并分析和快照写入。</div>' : ''}
                             <div class="dco-card-title">后端真实 usage</div>
                             <div class="dco-metric-grid">
                                 <div class="dco-metric accent"><span>Prompt tokens</span><b>${formatNumber(usageMetrics.promptTokens)}</b></div>
@@ -3504,6 +3530,9 @@ function bindSettings() {
     $('#dco_strategy').val(settings.strategy).closest('label').toggle(settings.enabled);
     $('#dco_protect_rich_format').prop('checked', settings.protectRichFormat).closest('label').toggle(settings.enabled);
     $('#dco_debug').prop('checked', settings.debug);
+    $('#dco_diagnostics_enabled').prop('checked', settings.diagnosticsEnabled);
+    $('#dco_record_request_history').prop('checked', settings.recordRequestHistory).closest('label').toggle(settings.diagnosticsEnabled);
+    $('#dco_merged_diagnostics').prop('checked', settings.mergedDiagnostics).closest('label').toggle(settings.diagnosticsEnabled);
     $('#dco_memory_enabled').prop('checked', settings.memoryEnabled);
     $('#dco_memory_llm_enabled').prop('checked', settings.memoryLlmEnabled);
 
@@ -3523,6 +3552,20 @@ function bindSettings() {
     });
     $('#dco_debug').on('input', function () {
         settings.debug = Boolean(this.checked);
+        saveSettingsDebounced();
+    });
+    $('#dco_diagnostics_enabled').on('input', function () {
+        settings.diagnosticsEnabled = Boolean(this.checked);
+        $('#dco_record_request_history').closest('label').toggle(settings.diagnosticsEnabled);
+        $('#dco_merged_diagnostics').closest('label').toggle(settings.diagnosticsEnabled);
+        saveSettingsDebounced();
+    });
+    $('#dco_record_request_history').on('input', function () {
+        settings.recordRequestHistory = Boolean(this.checked);
+        saveSettingsDebounced();
+    });
+    $('#dco_merged_diagnostics').on('input', function () {
+        settings.mergedDiagnostics = Boolean(this.checked);
         saveSettingsDebounced();
     });
     $('#dco_memory_enabled').on('input', function () {
@@ -3569,7 +3612,7 @@ function renderSettings() {
                     <summary class="dco-section-title">缓存优化</summary>
                     <label class="checkbox_label dco-inline" for="dco_enabled">
                         <input id="dco_enabled" type="checkbox" />
-                        <span>启用 Prompt 消息重排（关闭后仅保留记忆注入）</span>
+                        <span>启用 Prompt 消息重排</span>
                     </label>
                     <label for="dco_strategy">
                         <span>策略</span>
@@ -3601,6 +3644,18 @@ function renderSettings() {
                         <input id="dco_debug" type="checkbox" />
                         <span>浏览器控制台调试日志</span>
                     </label>
+                    <label class="checkbox_label dco-inline" for="dco_diagnostics_enabled">
+                        <input id="dco_diagnostics_enabled" type="checkbox" />
+                        <span>启用请求诊断</span>
+                    </label>
+                    <label class="checkbox_label dco-inline" for="dco_record_request_history">
+                        <input id="dco_record_request_history" type="checkbox" />
+                        <span>保存请求快照</span>
+                    </label>
+                    <label class="checkbox_label dco-inline" for="dco_merged_diagnostics">
+                        <input id="dco_merged_diagnostics" type="checkbox" />
+                        <span>后端合并分析</span>
+                    </label>
                     <button id="dco_export_prompt" class="menu_button dco-full-btn"><i class="fa-solid fa-file-export"></i> 导出所有快照</button>
                 </details>
                 <div class="dco-muted">
@@ -3621,38 +3676,44 @@ function renderSettings() {
 }
 
 export async function init() {
-    getSettings();
+    const settings = getSettings();
     renderSettings();
     window.dcoExportPrompt = () => exportPromptSnapshot();
     window.dcoExportAll = () => exportAllSnapshots();
-    try {
-        previousRawContent = localStorage.getItem('dco_prevRawContent') || '';
-        previousRawInput = localStorage.getItem('dco_prevRawInput') || '';
-        previousMergedContent = localStorage.getItem('dco_prevMergedContent') || '';
-    } catch { /* localStorage unavailable */ }
+    if (settings.diagnosticsEnabled) {
+        try {
+            previousRawContent = localStorage.getItem('dco_prevRawContent') || '';
+            previousRawInput = localStorage.getItem('dco_prevRawInput') || '';
+            previousMergedContent = localStorage.getItem('dco_prevMergedContent') || '';
+        } catch { /* localStorage unavailable */ }
+    } else {
+        try { localStorage.removeItem('dco_prevRawContent'); localStorage.removeItem('dco_prevRawInput'); localStorage.removeItem('dco_prevMergedContent'); } catch { /* localStorage unavailable */ }
+    }
     // Restore request history from IndexedDB
-    try {
-        const snapshots = await loadSnapshotsFromDb();
-        if (snapshots.length) {
-            requestHistory = snapshots.map(snap => ({
-                id: snap.id,
-                at: snap.at,
-                model: snap.model,
-                stream: false,
-                status: snap.usage ? '已收到 usage' : '来自历史',
-                usageReceived: Boolean(snap.usage),
-                usage: snap.usage,
-                stats: snap.stats,
-                messages: snap.messages,
-                messageSignatures: snap.messages.map((m, i) => ({
-                    index: i, role: m.role, length: (m.content || '').length,
-                    hash: m.hash, rich: false, preview: (m.content || '').slice(0, 80),
-                })),
-            }));
-            usageHistory = requestHistory.filter(item => item.usageReceived).slice(0, 20);
-            promptRunCounter = requestHistory.length;
-        }
-    } catch { /* IndexedDB unavailable */ }
+    if (settings.diagnosticsEnabled && settings.recordRequestHistory) {
+        try {
+            const snapshots = await loadSnapshotsFromDb();
+            if (snapshots.length) {
+                requestHistory = snapshots.map(snap => ({
+                    id: snap.id,
+                    at: snap.at,
+                    model: snap.model,
+                    stream: false,
+                    status: snap.usage ? '已收到 usage' : '来自历史',
+                    usageReceived: Boolean(snap.usage),
+                    usage: snap.usage,
+                    stats: snap.stats,
+                    messages: snap.messages,
+                    messageSignatures: snap.messages.map((m, i) => ({
+                        index: i, role: m.role, length: (m.content || '').length,
+                        hash: m.hash, rich: false, preview: (m.content || '').slice(0, 80),
+                    })),
+                }));
+                usageHistory = requestHistory.filter(item => item.usageReceived).slice(0, 20);
+                promptRunCounter = requestHistory.length;
+            }
+        } catch { /* IndexedDB unavailable */ }
+    }
     eventSource.on(event_types.CHAT_CHANGED, () => {
         lastRecallResults = [];
         previousSerializedPrompt = '';
@@ -3672,11 +3733,3 @@ export async function init() {
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, optimizeChatCompletionPrompt);
     eventSource.on(event_types.CHAT_COMPLETION_RESPONSE_USAGE, handleBackendUsage);
 }
-
-
-
-
-
-
-
-
