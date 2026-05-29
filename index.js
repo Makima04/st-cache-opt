@@ -1,4 +1,4 @@
-import {
+﻿import {
     characters,
     chat,
     eventSource,
@@ -55,54 +55,44 @@ const defaultSettings = {
 };
 
 const DB_NAME = 'deepseek-cache-optimizer-memory';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const MEMORY_INJECTION_MARKER = '<记忆数据库>';
 
 const TABLE_SCHEMAS = {
-    global_state: {
-        label: '当前状态',
+    scene_state: {
+        label: '当前场景',
         singleton: true,
-        columns: ['location', 'time', 'scene', 'atmosphere'],
+        columns: ['location', 'time', 'currentActivity', 'mood', 'activeEntities', 'openThreads'],
     },
-    protagonist_info: {
-        label: '角色信息',
-        singleton: true,
-        columns: ['name', 'appearance', 'personality', 'currentState', 'background', 'traits', 'abilities'],
-    },
-    user_info: {
-        label: 'User角色',
-        singleton: true,
-        columns: ['name', 'appearance', 'personality', 'persona'],
-    },
-    important_characters: {
-        label: '重要角色',
+    entities: {
+        label: '实体',
         singleton: false,
-        keyColumn: 'name',
-        columns: ['name', 'role', 'appearance', 'relationship', 'status', 'traits', 'lastInteraction'],
+        keyColumn: 'id',
+        columns: ['id', 'type', 'canonicalName', 'aliases', 'description', 'status', 'importance', 'confidence', 'firstTurn', 'lastTurn'],
     },
-    chronicle: {
-        label: '编年史',
+    facts: {
+        label: '事实',
         singleton: false,
-        keyColumn: 'amCode',
-        columns: ['amCode', 'summary', 'entities', 'keywords', 'turn', 'importance'],
-    },
-    items: {
-        label: '物品',
-        singleton: false,
-        keyColumn: 'name',
-        columns: ['name', 'type', 'owner', 'description', 'location', 'status'],
+        keyColumn: 'id',
+        columns: ['id', 'subjectId', 'predicate', 'value', 'category', 'permanence', 'confidence', 'importance', 'sourceTurns'],
     },
     relationships: {
         label: '关系',
         singleton: false,
-        keyColumn: 'relKey',
-        columns: ['relKey', 'fromChar', 'toChar', 'type', 'value', 'notes'],
+        keyColumn: 'id',
+        columns: ['id', 'fromId', 'toId', 'type', 'value', 'stableSummary', 'recentChange', 'confidence'],
     },
-    world_lore: {
-        label: '世界观',
+    events: {
+        label: '事件',
         singleton: false,
-        keyColumn: 'key',
-        columns: ['key', 'category', 'content'],
+        keyColumn: 'id',
+        columns: ['id', 'summary', 'participants', 'locationId', 'keywords', 'turnStart', 'turnEnd', 'importance', 'noveltyHash', 'mergedFrom', 'status'],
+    },
+    memory_audit: {
+        label: '记忆审计',
+        singleton: false,
+        keyColumn: 'id',
+        columns: ['id', 'turn', 'rawProposal', 'acceptedOps', 'rejectedOps', 'reason', 'createdAt'],
     },
 };
 
@@ -314,8 +304,8 @@ function openMemoryDb() {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
         request.onupgradeneeded = () => {
             const db = request.result;
-            if (db.objectStoreNames.contains('memories')) {
-                db.deleteObjectStore('memories');
+            for (const storeName of Array.from(db.objectStoreNames)) {
+                db.deleteObjectStore(storeName);
             }
             for (const tableName of Object.keys(TABLE_SCHEMAS)) {
                 if (!db.objectStoreNames.contains(tableName)) {
@@ -507,6 +497,39 @@ function mergeUniqueRows(rows, keyField, limit) {
     return merged;
 }
 
+function slugifyIdPart(value, fallback = 'item') {
+    const text = normalizeText(value).toLowerCase();
+    const ascii = text.replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '');
+    return (ascii || fallback).slice(0, 80);
+}
+
+function makeMemoryId(prefix, ...parts) {
+    return [prefix, ...parts.map(part => slugifyIdPart(part)).filter(Boolean)].join(':');
+}
+
+function parseListValue(value) {
+    if (Array.isArray(value)) {
+        return value.map(item => normalizeText(item)).filter(Boolean);
+    }
+    return String(value || '')
+        .split(/[,，、|]/)
+        .map(item => normalizeText(item))
+        .filter(Boolean);
+}
+
+function clampNumber(value, min, max, fallback = min) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+    return Math.min(max, Math.max(min, number));
+}
+
+function isInvalidEntityName(value) {
+    const text = normalizeText(value).toLowerCase();
+    return !text || ['singleton', 'unknown', 'undefined', 'null', 'n/a'].includes(text);
+}
+
 function stripExtractionNoise(text) {
     return String(text || '')
         .replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/g, '')
@@ -529,21 +552,19 @@ function buildMemoryExtractionTranscript(turns) {
 
 function buildMemoryExtractionStaticMessages() {
     const rolePrompt = [
-        '你是【填表AI】，负责根据聊天片段对记忆数据库执行增删改操作。',
-        '只输出 <tableEdit>...</tableEdit> 命令块，不要输出解释、寒暄或 Markdown。',
-        '只提取对后续剧情有持久影响的信息；忽略临时动作、无意义寒暄和样式代码。',
+        '你是【长期记忆整理 AI】，负责把聊天片段整理成结构化长期记忆。',
+        '你必须先抽取，再清洗、合并、降噪，最后只输出 <tableEdit>...</tableEdit> 命令块。',
+        '不要输出解释、寒暄或 Markdown。不要把临时动作、样式代码、网页 UI、无长期影响的流水账写入长期记忆。',
     ].join('\n');
 
     const schemaPrompt = [
-        '## 表结构',
-        '- global_state: location(位置), time(时间), scene(场景), atmosphere(氛围)',
-        '- protagonist_info: name(姓名), appearance(外貌描述), personality(性格), currentState(当前状态), background(背景), traits(特征逗号分隔), abilities(能力逗号分隔)',
-        '- user_info: name(姓名), appearance(外貌描述), personality(性格), persona(人设描述)',
-        '- important_characters: name(姓名), role(角色), appearance(外貌描述), relationship(与主角关系), status(状态), traits(特征逗号分隔), lastInteraction(最近互动摘要)',
-        '- chronicle: summary(事件摘要≤50字), entities(相关人物逗号分隔), keywords(关键词逗号分隔), importance(0-1浮点)',
-        '- items: name(名称), type(类型如武器/道具/食物), owner(持有者), description(描述), location(所在位置), status(状态如正常/损坏)',
-        '- relationships: relKey(关系键如"A→B"), fromChar(角色A), toChar(角色B), type(关系类型), value(亲密度-1到1), notes(备注)',
-        '- world_lore: key(关键词), category(类别如规则/地点/组织), content(内容描述)',
+        '## 新记忆库结构',
+        '- scene_state 单例: location, time, currentActivity, mood, activeEntities(逗号分隔), openThreads(逗号分隔)',
+        '- entities: id, type(character/place/item/rule/concept/organization), canonicalName, aliases, description, status, importance(0-1), confidence(0-1), firstTurn, lastTurn',
+        '- facts: id, subjectId, predicate, value, category(appearance/personality/background/rule/status/ability/lore/item/persona), permanence(stable/session/temporary), confidence(0-1), importance(0-1), sourceTurns',
+        '- relationships: id, fromId, toId, type, value(0-1), stableSummary, recentChange, confidence(0-1)',
+        '- events: id, summary, participants(实体id逗号分隔), locationId, keywords, turnStart, turnEnd, importance(0-1), noveltyHash, mergedFrom, status(active/merged/expired)',
+        '- memory_audit: id, turn, rawProposal, acceptedOps, rejectedOps, reason, createdAt',
     ].join('\n');
 
     const commandPrompt = [
@@ -555,26 +576,28 @@ function buildMemoryExtractionStaticMessages() {
         'deleteRow("table_name", "key_value")',
         '</tableEdit>',
         '',
-        '## 规则',
-        '1. global_state、protagonist_info、user_info 始终用 updateRow("表名", "singleton", {...})',
-        '2. important_characters、items、world_lore 用名称作为键值，新条目用 insertRow，已存在用 updateRow',
-        '3. relationships 用 relKey 作为键值（格式："A→B"），新关系用 insertRow，已存在用 updateRow',
-        '4. chronicle 只用 insertRow，不需要指定 amCode（自动生成）',
-        '5. 外貌描写必须详细（发型、瞳色、体型、服饰、特征等），不能只写一个词',
-        '6. summary 必须是简洁的一句话总结（≤50字），不是原文复制',
-        '7. important_characters 必须包含 User 角色（扮演的用户身份，不是 AI 助手）',
+        '## 写入规则',
+        '1. scene_state 始终用 updateRow("scene_state", "singleton", {...})。',
+        '2. 实体必须使用稳定 id：character:姓名、place:地点、item:物品、rule:规则名、concept:概念。禁止把 singleton/unknown/null 当成实体名。',
+        '3. 同一人、同一地点、同一物品必须复用已有实体 id；别名写 aliases，不要重复 insert。',
+        '4. 角色外貌、性格、背景、能力、规则、稳定身份写 facts；当前姿势、表情、一次性动作不要写 facts。',
+        '5. 关系表只写稳定关系与最近变化，不要把完整事件流水塞进 stableSummary。',
+        '6. events 只写有长期意义的事件。重复事件要 update 旧事件，合并 summary/turnEnd/mergedFrom，不要新增相似流水账。',
+        '7. 日常训练、吃饭、洗澡、拥抱、奖励等若没有长期后果，importance 最高 0.45；规则变化、身份变化、关系转折、长期伏笔可为 0.7 以上。',
+        '8. 已使用、已消耗、离开当前场景的临时物品写 temporary fact 或直接忽略，不要长期保留。',
+        '9. 每次输出最后必须插入一条 memory_audit，记录本次接受/拒绝/合并原因。',
+        '10. 如果没有值得写入的长期记忆，只输出 memory_audit，reason 写“无长期记忆变化”。',
     ].join('\n');
 
     const examplePrompt = [
         '## 示例输出',
         '<tableEdit>',
-        'updateRow("global_state", "singleton", {"location":"酒馆二楼","time":"深夜","scene":"密谈","atmosphere":"紧张"})',
-        'updateRow("protagonist_info", "singleton", {"appearance":"银发及腰，紫瞳，身材纤细，穿白色长裙","traits":"冷静,机智","abilities":"魔法感知"})',
-        'insertRow("important_characters", {"name":"艾莉丝","role":"盟友","appearance":"金色短发，碧绿眼眸，精灵耳，穿皮革轻甲","relationship":"信任的伙伴","status":"在场","traits":"勇敢,忠诚"})',
-        'insertRow("items", {"name":"月光匕首","type":"武器","owner":"主角","description":"散发淡蓝光芒的精灵匕首","location":"腰间","status":"正常"})',
-        'insertRow("relationships", {"relKey":"主角→艾莉丝","fromChar":"主角","toChar":"艾莉丝","type":"盟友","value":0.8,"notes":"共同经历了多次冒险"})',
-        'insertRow("world_lore", {"key":"空庭","category":"地点","content":"一个被魔法封锁的异空间，有严格的规则体系"})',
-        'insertRow("chronicle", {"summary":"主角与艾莉丝达成秘密协议","entities":"主角,艾莉丝","keywords":"协议,密谋","importance":0.8})',
+        'updateRow("scene_state", "singleton", {"location":"月泉浴室","time":"夜晚","currentActivity":"共浴后交谈","mood":"放松但暧昧","activeEntities":"character:时幼微,character:浅野堇,place:月泉","openThreads":"浅野堇对依赖感仍嘴硬"})',
+        'insertRow("entities", {"id":"character:时幼微","type":"character","canonicalName":"时幼微","aliases":"魔女,主人","description":"三千年阅历的魔女，掌控欲强但温柔狡黠","status":"在场","importance":0.95,"confidence":0.95,"firstTurn":1,"lastTurn":35})',
+        'insertRow("facts", {"id":"fact:character:时幼微:appearance","subjectId":"character:时幼微","predicate":"appearance","value":"墨色长发，紫罗兰色眼眸，常穿白色棉质T恤和运动短裙","category":"appearance","permanence":"stable","confidence":0.85,"importance":0.75,"sourceTurns":"1-35"})',
+        'updateRow("relationships", "rel:character:时幼微->character:浅野堇", {"id":"rel:character:时幼微->character:浅野堇","fromId":"character:时幼微","toId":"character:浅野堇","type":"主人与宠物","value":0.75,"stableSummary":"时幼微主导关系，浅野堇开始主动亲近但仍嘴硬","recentChange":"浅野堇训练后主动求抱，依赖感上升","confidence":0.85})',
+        'insertRow("events", {"id":"event:训练后主动求抱","summary":"浅野堇多次在训练后主动求抱，时幼微用拥抱和奖励回应，双方依赖感上升。","participants":"character:浅野堇,character:时幼微","locationId":"place:伊甸","keywords":"训练,求抱,奖励,依赖","turnStart":21,"turnEnd":31,"importance":0.55,"noveltyHash":"训练求抱奖励依赖","mergedFrom":"AM0002,AM0003,AM0005","status":"active"})',
+        'insertRow("memory_audit", {"id":"audit:35","turn":35,"rawProposal":"抽取近期训练、共浴与关系变化","acceptedOps":"更新场景;合并训练求抱事件;更新关系","rejectedOps":"未保留已使用矿泉水;未重复新增相似训练事件","reason":"保留长期关系变化，过滤临时流水账","createdAt":"now"})',
         '</tableEdit>',
     ].join('\n');
 
@@ -616,66 +639,36 @@ function buildMemoryExtractionMessages(turns, worldTerms, tableData) {
 function buildTableStateSnapshot(tableData) {
     if (!tableData) return '';
     const lines = [];
-    const state = tableData.state?.[0];
-    if (state) {
+    const scene = tableData.sceneState?.[0];
+    if (scene) {
         const parts = [];
-        if (state.location) parts.push(`位置：${state.location}`);
-        if (state.time) parts.push(`时间：${state.time}`);
-        if (state.scene) parts.push(`场景：${state.scene}`);
-        if (state.atmosphere) parts.push(`氛围：${state.atmosphere}`);
-        if (parts.length) lines.push(`[global_state] ${parts.join(' | ')}`);
+        if (scene.location) parts.push(`位置：${scene.location}`);
+        if (scene.time) parts.push(`时间：${scene.time}`);
+        if (scene.currentActivity) parts.push(`活动：${scene.currentActivity}`);
+        if (scene.mood) parts.push(`氛围：${scene.mood}`);
+        if (scene.activeEntities) parts.push(`活跃：${scene.activeEntities}`);
+        if (scene.openThreads) parts.push(`悬念：${scene.openThreads}`);
+        if (parts.length) lines.push(`[scene_state] ${parts.join(' | ')}`);
     }
-    const protag = tableData.protagonist?.[0];
-    if (protag) {
-        const parts = [];
-        if (protag.name) parts.push(`姓名：${protag.name}`);
-        if (protag.appearance) parts.push(`外貌：${protag.appearance}`);
-        if (protag.currentState) parts.push(`状态：${protag.currentState}`);
-        if (protag.personality) parts.push(`性格：${protag.personality}`);
-        if (protag.background) parts.push(`背景：${protag.background}`);
-        if (protag.traits) parts.push(`特征：${protag.traits}`);
-        if (parts.length) lines.push(`[protagonist_info] ${parts.join(' | ')}`);
-    }
-    const userInfo = tableData.userInfo?.[0];
-    if (userInfo) {
-        const parts = [];
-        if (userInfo.name) parts.push(`姓名：${userInfo.name}`);
-        if (userInfo.appearance) parts.push(`外貌：${userInfo.appearance}`);
-        if (userInfo.persona) parts.push(`人设：${userInfo.persona.slice(0, 100)}`);
-        if (parts.length) lines.push(`[user_info] ${parts.join(' | ')}`);
-    }
-    if (tableData.characters?.length) {
-        for (const c of tableData.characters) {
-            const parts = [c.name];
-            if (c.role) parts.push(c.role);
-            if (c.relationship) parts.push(c.relationship);
-            if (c.status) parts.push(c.status);
-            if (c.traits) parts.push(`特征:${c.traits}`);
-            lines.push(`[character] ${parts.join(' / ')}`);
+    if (tableData.entities?.length) {
+        for (const entity of tableData.entities.slice(0, 40)) {
+            lines.push(`[entity] ${entity.id} ${entity.type || ''} ${entity.canonicalName || ''}: ${(entity.description || '').slice(0, 80)} status=${entity.status || ''}`);
         }
     }
-    if (tableData.items?.length) {
-        for (const item of tableData.items) {
-            const parts = [item.name];
-            if (item.type) parts.push(item.type);
-            if (item.owner) parts.push(`持有:${item.owner}`);
-            if (item.status) parts.push(item.status);
-            lines.push(`[item] ${parts.join(' / ')}`);
+    if (tableData.facts?.length) {
+        for (const fact of tableData.facts.slice(0, 60)) {
+            lines.push(`[fact] ${fact.id} ${fact.subjectId}.${fact.predicate}=${String(fact.value || '').slice(0, 90)} permanence=${fact.permanence || ''}`);
         }
     }
     if (tableData.relationships?.length) {
-        for (const r of tableData.relationships) {
-            lines.push(`[relationship] ${r.relKey}: ${r.type}(${r.value}) ${r.notes || ''}`);
+        for (const rel of tableData.relationships.slice(0, 30)) {
+            lines.push(`[relationship] ${rel.id}: ${rel.type}(${rel.value}) ${rel.stableSummary || ''} ${rel.recentChange || ''}`);
         }
     }
-    if (tableData.worldLore?.length) {
-        for (const w of tableData.worldLore) {
-            lines.push(`[world_lore] ${w.key}(${w.category}): ${(w.content || '').slice(0, 60)}`);
-        }
-    }
-    if (tableData.chronicle?.length) {
-        for (const entry of tableData.chronicle.slice(-10)) {
-            lines.push(`[${entry.amCode}] ${entry.summary}`);
+    if (tableData.events?.length) {
+        const events = [...tableData.events].sort((a, b) => Number(b.turnEnd || 0) - Number(a.turnEnd || 0));
+        for (const event of events.slice(0, 30)) {
+            lines.push(`[event] ${event.id} turn=${event.turnStart || ''}-${event.turnEnd || ''} importance=${event.importance || ''}: ${event.summary || ''}`);
         }
     }
     return lines.join('\n');
@@ -715,44 +708,139 @@ function parseTableCommands(llmOutput) {
     return commands;
 }
 
+function normalizeMemoryRow(tableName, data, keyValue = '') {
+    const row = { ...(data || {}) };
+    const turn = chat.length;
+
+    if (tableName === 'scene_state') {
+        row._key = 'singleton';
+        return row;
+    }
+
+    if (tableName === 'entities') {
+        const name = row.canonicalName || keyValue || row.id;
+        if (isInvalidEntityName(name)) return null;
+        row.type = String(row.type || 'concept').toLowerCase();
+        row.canonicalName = normalizeText(name);
+        row.id = row.id || makeMemoryId(row.type, row.canonicalName);
+        if (isInvalidEntityName(row.id)) return null;
+        row.importance = clampNumber(row.importance, 0, 1, 0.5);
+        row.confidence = clampNumber(row.confidence, 0, 1, 0.7);
+        row.firstTurn = Number(row.firstTurn || turn);
+        row.lastTurn = Number(row.lastTurn || turn);
+        return row;
+    }
+
+    if (tableName === 'facts') {
+        if (!row.subjectId || !row.predicate || !row.value) return null;
+        row.predicate = slugifyIdPart(row.predicate, 'fact');
+        row.id = row.id || makeMemoryId('fact', row.subjectId, row.predicate);
+        row.permanence = ['stable', 'session', 'temporary'].includes(row.permanence) ? row.permanence : 'stable';
+        row.confidence = clampNumber(row.confidence, 0, 1, 0.7);
+        row.importance = clampNumber(row.importance, 0, 1, row.permanence === 'temporary' ? 0.25 : 0.55);
+        row.sourceTurns = row.sourceTurns || String(turn);
+        return row;
+    }
+
+    if (tableName === 'relationships') {
+        if (!row.fromId || !row.toId) return null;
+        row.id = row.id || keyValue || `rel:${row.fromId}->${row.toId}`;
+        row.value = clampNumber(row.value, -1, 1, 0);
+        row.confidence = clampNumber(row.confidence, 0, 1, 0.7);
+        return row;
+    }
+
+    if (tableName === 'events') {
+        if (!row.summary) return null;
+        row.participants = parseListValue(row.participants).join(',');
+        row.keywords = parseListValue(row.keywords).join(',');
+        row.turnStart = Number(row.turnStart || turn);
+        row.turnEnd = Number(row.turnEnd || row.turnStart || turn);
+        row.importance = clampNumber(row.importance, 0, 1, 0.4);
+        row.noveltyHash = row.noveltyHash || slugifyIdPart(`${row.summary} ${row.participants} ${row.keywords}`, 'event');
+        row.id = row.id || makeMemoryId('event', row.noveltyHash);
+        row.status = row.status || 'active';
+        return row;
+    }
+
+    if (tableName === 'memory_audit') {
+        row.turn = Number(row.turn || turn);
+        row.id = row.id || makeMemoryId('audit', row.turn, Date.now());
+        row.createdAt = row.createdAt === 'now' || !row.createdAt ? new Date().toISOString() : row.createdAt;
+        return row;
+    }
+
+    return row;
+}
+
+function shouldMergeEvents(existing, incoming) {
+    if (!existing || !incoming) return false;
+    if (existing.id === incoming.id) return true;
+    const existingHash = normalizeText(existing.noveltyHash).toLowerCase();
+    const incomingHash = normalizeText(incoming.noveltyHash).toLowerCase();
+    if (existingHash && incomingHash && existingHash === incomingHash) return true;
+    const existingTerms = splitTerms(`${existing.summary} ${existing.keywords} ${existing.participants}`);
+    const incomingText = normalizeText(`${incoming.summary} ${incoming.keywords} ${incoming.participants}`).toLowerCase();
+    const overlap = existingTerms.filter(term => incomingText.includes(term)).length;
+    return overlap >= Math.min(4, Math.max(2, existingTerms.length));
+}
+
+async function upsertMemoryRow(tableName, row, keyValue = '') {
+    const schema = TABLE_SCHEMAS[tableName];
+    if (!schema) return false;
+    const normalized = normalizeMemoryRow(tableName, row, keyValue);
+    if (!normalized) return false;
+
+    if (schema.singleton) {
+        normalized._key = 'singleton';
+        await putRow(tableName, normalized);
+        return true;
+    }
+
+    const keyCol = schema.keyColumn;
+    const existing = await getTable(tableName);
+
+    if (tableName === 'events') {
+        const target = existing.find(item => shouldMergeEvents(item, normalized));
+        if (target) {
+            target.summary = normalized.summary || target.summary;
+            target.participants = mergeListStrings(target.participants, normalized.participants);
+            target.keywords = mergeListStrings(target.keywords, normalized.keywords);
+            target.turnStart = Math.min(Number(target.turnStart || normalized.turnStart), Number(normalized.turnStart || target.turnStart));
+            target.turnEnd = Math.max(Number(target.turnEnd || normalized.turnEnd), Number(normalized.turnEnd || target.turnEnd));
+            target.importance = Math.max(Number(target.importance || 0), Number(normalized.importance || 0));
+            target.mergedFrom = mergeListStrings(target.mergedFrom, normalized.mergedFrom || normalized.id);
+            target.status = 'active';
+            await putRow(tableName, target);
+            return true;
+        }
+    }
+
+    const key = normalized[keyCol] || keyValue;
+    const target = existing.find(item => item[keyCol] === key);
+    if (target) {
+        await putRow(tableName, { ...target, ...normalized, [keyCol]: key });
+    } else {
+        await putRow(tableName, { ...normalized, [keyCol]: key });
+    }
+    return true;
+}
+
+function mergeListStrings(a, b) {
+    return [...new Set([...parseListValue(a), ...parseListValue(b)])].join(',');
+}
+
 async function executeTableCommands(commands) {
     let executed = 0;
-    const chronicleRows = await getTable('chronicle');
-    let nextAmCode = chronicleRows.reduce((max, r) => {
-        const num = parseInt(String(r.amCode || '').replace('AM', ''), 10);
-        return isNaN(num) ? max : Math.max(max, num);
-    }, 0) + 1;
-
     for (const cmd of commands) {
         try {
             const schema = TABLE_SCHEMAS[cmd.table];
             if (!schema) continue;
 
             if (cmd.action === 'insertRow') {
-                if (cmd.table === 'chronicle') {
-                    cmd.data.amCode = `AM${String(nextAmCode++).padStart(4, '0')}`;
-                    cmd.data.turn = chat.length;
-                }
-                await putRow(cmd.table, cmd.data);
-                executed++;
+                if (await upsertMemoryRow(cmd.table, cmd.data)) executed++;
             } else if (cmd.action === 'updateRow') {
-                if (schema.singleton) {
-                    cmd.data._key = 'singleton';
-                    await putRow(cmd.table, cmd.data);
-                } else {
-                    const existing = await getTable(cmd.table);
-                    const keyCol = schema.keyColumn;
-                    const target = existing.find(r => r[keyCol] === cmd.keyValue);
-                    if (target) {
-                        Object.assign(target, cmd.data);
-                        await putRow(cmd.table, target);
-                    } else {
-                        // Key not found, treat as insert
-                        if (keyCol) cmd.data[keyCol] = cmd.keyValue;
-                        await putRow(cmd.table, cmd.data);
-                    }
-                }
-                executed++;
+                if (await upsertMemoryRow(cmd.table, cmd.data, cmd.keyValue)) executed++;
             } else if (cmd.action === 'deleteRow') {
                 await deleteRow(cmd.table, cmd.keyValue);
                 executed++;
@@ -901,14 +989,12 @@ async function runMemoryLlmExtraction({ manual = false } = {}) {
 
     try {
         const tableData = {
-            state: await getTable('global_state'),
-            protagonist: await getTable('protagonist_info'),
-            userInfo: await getTable('user_info'),
-            characters: await getTable('important_characters'),
-            chronicle: await getTable('chronicle'),
-            items: await getTable('items'),
+            sceneState: await getTable('scene_state'),
+            entities: await getTable('entities'),
+            facts: await getTable('facts'),
             relationships: await getTable('relationships'),
-            worldLore: await getTable('world_lore'),
+            events: await getTable('events'),
+            audit: await getTable('memory_audit'),
         };
         const extractionMessages = buildMemoryExtractionMessages(turns, worldTerms, tableData);
         const result = settings.memoryLlmProvider === 'direct'
@@ -957,205 +1043,152 @@ async function recallStructuredMemory(messages) {
         return null;
     }
 
-    const state = (await getTable('global_state'))[0] || null;
-    const protagonist = (await getTable('protagonist_info'))[0] || null;
-    const allCharacters = await getTable('important_characters');
-    const allChronicle = await getTable('chronicle');
-    const allItems = await getTable('items');
+    const sceneState = (await getTable('scene_state'))[0] || null;
+    const allEntities = await getTable('entities');
+    const allFacts = await getTable('facts');
     const allRelationships = await getTable('relationships');
-    const allWorldLore = await getTable('world_lore');
+    const allEvents = await getTable('events');
 
-    // Auto-inject User persona if user_info table is empty
-    let userInfo = (await getTable('user_info'))[0] || null;
-    if (!userInfo && power_user.persona_description) {
-        userInfo = {
-            _key: 'singleton',
-            name: name1 || 'User',
-            persona: power_user.persona_description,
-        };
-        await putRow('user_info', userInfo);
-    }
-
-    const maxChronicle = Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle);
-    const maxCharacters = Number(settings.memoryMaxCharacters ?? defaultSettings.memoryMaxCharacters);
-    const maxItems = Number(settings.memoryMaxItems ?? defaultSettings.memoryMaxItems);
-    const maxRelationships = Number(settings.memoryMaxRelationships ?? defaultSettings.memoryMaxRelationships);
-    const maxWorldLore = Number(settings.memoryMaxWorldLore ?? defaultSettings.memoryMaxWorldLore);
-    const minImportance = Number(settings.memoryMinImportance ?? defaultSettings.memoryMinImportance);
-    const recentChronicleLimit = Number(settings.memoryRecentChronicle ?? defaultSettings.memoryRecentChronicle);
-
-    const queryText = normalizeText(buildMemoryQuery(messages, state, protagonist, userInfo)).toLowerCase();
+    const queryText = normalizeText([
+        getRecentMessageText(messages, 8),
+        rowText(sceneState),
+        name1,
+        name2,
+    ].filter(Boolean).join('\n')).toLowerCase();
     const queryTerms = splitTerms(queryText);
     const worldTerms = getWorldInfoTerms();
-    const actorNames = new Set([name1, name2, protagonist?.name, userInfo?.name].filter(Boolean).map(value => normalizeText(value).toLowerCase()));
+    const activeEntityIds = new Set(parseListValue(sceneState?.activeEntities));
 
-    for (const row of allCharacters) {
-        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) {
-            actorNames.add(normalizeText(row.name).toLowerCase());
+    for (const entity of allEntities) {
+        const names = [entity.id, entity.canonicalName, entity.aliases].filter(Boolean).join(' ');
+        if (isExplicitlyMentioned(names, queryTerms, queryText)) {
+            activeEntityIds.add(entity.id);
         }
     }
 
-    const activeCharacters = pickTopRows(allCharacters, row => {
-        const text = rowText(row, ['name', 'role', 'relationship', 'status', 'traits', 'lastInteraction']);
-        let score = scoreTextAgainstTerms(text, queryTerms, 1.5);
+    const stableEntities = pickTopRows(allEntities, entity => {
+        const text = rowText(entity, ['id', 'type', 'canonicalName', 'aliases', 'description', 'status']);
+        let score = Number(entity.importance || 0) * 2;
+        score += scoreTextAgainstTerms(text, queryTerms, 1.4);
         score += scoreTextAgainstTerms(text, worldTerms, 0.35);
-        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) score += 8;
-        if (row.relationship && scoreTextAgainstTerms(row.relationship, queryTerms, 1) > 0) score += 2;
+        if (activeEntityIds.has(entity.id)) score += 4;
+        if (['character', 'rule', 'place'].includes(entity.type)) score += 0.75;
         return score;
-    }, maxCharacters);
+    }, Number(settings.memoryMaxCharacters ?? defaultSettings.memoryMaxCharacters) + Number(settings.memoryMaxWorldLore ?? defaultSettings.memoryMaxWorldLore));
 
-    for (const row of activeCharacters) {
-        if (row.name) {
-            actorNames.add(normalizeText(row.name).toLowerCase());
-        }
+    for (const entity of stableEntities) {
+        if (entity.id) activeEntityIds.add(entity.id);
     }
 
-    const relationships = pickTopRows(allRelationships, row => {
-        const text = rowText(row, ['relKey', 'fromChar', 'toChar', 'type', 'value', 'notes']);
-        const from = normalizeText(row.fromChar).toLowerCase();
-        const to = normalizeText(row.toChar).toLowerCase();
-        let score = scoreTextAgainstTerms(text, queryTerms, 1.25);
-        score += scoreTextAgainstTerms(text, worldTerms, 0.25);
-        if (from && actorNames.has(from)) score += 3;
-        if (to && actorNames.has(to)) score += 3;
-        if (isExplicitlyMentioned(row.relKey, queryTerms, queryText)) score += 4;
+    const stableFacts = pickTopRows(allFacts, fact => {
+        const text = rowText(fact, ['subjectId', 'predicate', 'value', 'category', 'permanence']);
+        let score = Number(fact.importance || 0) * 2;
+        score += scoreTextAgainstTerms(text, queryTerms, 1.2);
+        score += scoreTextAgainstTerms(text, worldTerms, 0.3);
+        if (activeEntityIds.has(fact.subjectId)) score += fact.permanence === 'stable' ? 3 : 1.5;
+        if (fact.permanence === 'temporary') score -= 1.5;
         return score;
-    }, maxRelationships);
+    }, 18);
 
-    const items = pickTopRows(allItems, row => {
-        const text = rowText(row, ['name', 'type', 'owner', 'description', 'location', 'status']);
-        const owner = normalizeText(row.owner).toLowerCase();
-        let score = scoreTextAgainstTerms(text, queryTerms, 1.25);
-        score += scoreTextAgainstTerms(text, worldTerms, 0.25);
-        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) score += 6;
-        if (owner && actorNames.has(owner)) score += 2;
-        if (state?.location && normalizeText(row.location).toLowerCase().includes(normalizeText(state.location).toLowerCase())) score += 1;
+    const relationships = pickTopRows(allRelationships, rel => {
+        const text = rowText(rel, ['fromId', 'toId', 'type', 'stableSummary', 'recentChange']);
+        let score = scoreTextAgainstTerms(text, queryTerms, 1.2) + Number(rel.confidence || 0);
+        if (activeEntityIds.has(rel.fromId)) score += 2.5;
+        if (activeEntityIds.has(rel.toId)) score += 2.5;
         return score;
-    }, maxItems);
+    }, Number(settings.memoryMaxRelationships ?? defaultSettings.memoryMaxRelationships));
 
-    const worldLore = pickTopRows(allWorldLore, row => {
-        const text = rowText(row, ['key', 'category', 'content']);
-        let score = scoreTextAgainstTerms(text, queryTerms, 1.2);
-        score += scoreTextAgainstTerms(text, worldTerms, 0.6);
-        if (isExplicitlyMentioned(row.key, queryTerms, queryText)) score += 6;
-        return score;
-    }, maxWorldLore);
-
-    const chronicleByTurn = [...allChronicle]
-        .sort((a, b) => Number(b.turn || 0) - Number(a.turn || 0));
-    const recentChronicle = chronicleByTurn.slice(0, Math.max(0, recentChronicleLimit));
-    const scoredChronicle = allChronicle
-        .map((row, index) => {
-            const text = rowText(row, ['amCode', 'summary', 'entities', 'keywords']);
-            const importance = Number(row.importance || 0);
-            const relevance = scoreTextAgainstTerms(text, queryTerms, 1.25) + scoreTextAgainstTerms(text, worldTerms, 0.25);
-            const explicit = isExplicitlyMentioned(row.amCode, queryTerms, queryText) ? 4 : 0;
-            const entityBoost = scoreTextAgainstTerms(row.entities, [...actorNames], 0.75);
-            return { row, index, score: relevance + explicit + entityBoost + Math.max(importance, 0) };
+    const recentEventLimit = Number(settings.memoryRecentChronicle ?? defaultSettings.memoryRecentChronicle);
+    const maxEvents = Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle);
+    const minImportance = Number(settings.memoryMinImportance ?? defaultSettings.memoryMinImportance);
+    const activeEvents = allEvents.filter(event => event.status !== 'merged' && event.status !== 'expired');
+    const recentEvents = [...activeEvents].sort((a, b) => Number(b.turnEnd || 0) - Number(a.turnEnd || 0)).slice(0, Math.max(0, recentEventLimit));
+    const scoredEvents = activeEvents
+        .map((event, index) => {
+            const text = rowText(event, ['summary', 'participants', 'locationId', 'keywords']);
+            const participants = parseListValue(event.participants);
+            let score = Number(event.importance || 0) * 2;
+            score += scoreTextAgainstTerms(text, queryTerms, 1.3);
+            score += scoreTextAgainstTerms(text, worldTerms, 0.25);
+            score += participants.filter(id => activeEntityIds.has(id)).length * 1.5;
+            return { row: event, index, score };
         })
         .filter(item => item.score > 0 && (Number(item.row.importance || 0) >= minImportance || item.score >= 2.5))
-        .sort((a, b) => b.score - a.score || Number(b.row.turn || 0) - Number(a.row.turn || 0) || a.index - b.index)
+        .sort((a, b) => b.score - a.score || Number(b.row.turnEnd || 0) - Number(a.row.turnEnd || 0) || a.index - b.index)
         .map(item => item.row);
-    const relevantChronicle = mergeUniqueRows([...recentChronicle, ...scoredChronicle], 'amCode', maxChronicle);
+    const events = mergeUniqueRows([...recentEvents, ...scoredEvents], 'id', maxEvents);
 
     lastRecallResults = [
-        ...activeCharacters.map(record => ({ type: 'character', record })),
+        ...stableEntities.map(record => ({ type: 'entity', record })),
+        ...stableFacts.map(record => ({ type: 'fact', record })),
         ...relationships.map(record => ({ type: 'relationship', record })),
-        ...items.map(record => ({ type: 'item', record })),
-        ...worldLore.map(record => ({ type: 'world_lore', record })),
-        ...relevantChronicle.map(record => ({ type: 'chronicle', record })),
+        ...events.map(record => ({ type: 'event', record })),
     ];
 
-    return { state, protagonist, userInfo, activeCharacters, relevantChronicle, items, relationships, worldLore };
+    return { sceneState, entities: stableEntities, facts: stableFacts, relationships, events };
 }
 
 function buildStructuredInjection(memory) {
     if (!memory) return '';
     const lines = [MEMORY_INJECTION_MARKER];
 
-    if (memory.state) {
-        lines.push('[当前状态]');
-        const parts = [];
-        if (memory.state.location) parts.push(`位置：${memory.state.location}`);
-        if (memory.state.time) parts.push(`时间：${memory.state.time}`);
-        if (memory.state.scene) parts.push(`场景：${memory.state.scene}`);
-        if (memory.state.atmosphere) parts.push(`氛围：${memory.state.atmosphere}`);
-        lines.push(parts.join(' | '));
-    }
+    const entitiesById = new Map((memory.entities || []).map(entity => [entity.id, entity]));
 
-    if (memory.protagonist) {
-        lines.push('[角色信息]');
-        const p = memory.protagonist;
-        const parts = [];
-        if (p.name) parts.push(`${p.name}`);
-        if (p.appearance) parts.push(`外貌：${p.appearance}`);
-        if (p.currentState) parts.push(`状态：${p.currentState}`);
-        if (p.personality) parts.push(`性格：${p.personality}`);
-        if (p.background) parts.push(`背景：${p.background}`);
-        if (p.traits) parts.push(`特征：${p.traits}`);
-        if (p.abilities) parts.push(`能力：${p.abilities}`);
-        lines.push(parts.join(' | '));
-    }
-
-    if (memory.userInfo) {
-        lines.push('[User角色]');
-        const u = memory.userInfo;
-        const parts = [];
-        if (u.name) parts.push(`${u.name}`);
-        if (u.appearance) parts.push(`外貌：${u.appearance}`);
-        if (u.personality) parts.push(`性格：${u.personality}`);
-        if (u.persona) parts.push(`人设：${u.persona}`);
-        lines.push(parts.join(' | '));
-    }
-
-    if (memory.activeCharacters?.length) {
-        lines.push('[活跃角色]');
-        for (const c of memory.activeCharacters) {
-            const parts = [c.name];
-            if (c.relationship) parts.push(c.relationship);
-            if (c.status) parts.push(c.status);
-            if (c.appearance) parts.push(c.appearance);
-            if (c.traits) parts.push(`特征:${c.traits}`);
-            lines.push(`- ${parts.join(' / ')}`);
+    if (memory.entities?.length) {
+        lines.push('[长期实体]');
+        for (const entity of memory.entities) {
+            const parts = [entity.canonicalName || entity.id, entity.type];
+            if (entity.aliases) parts.push(`别名:${entity.aliases}`);
+            if (entity.description) parts.push(entity.description);
+            if (entity.status) parts.push(`状态:${entity.status}`);
+            lines.push(`- ${parts.filter(Boolean).join(' / ')}`);
         }
     }
 
-    if (memory.items?.length) {
-        lines.push('[物品]');
-        for (const item of memory.items) {
-            const parts = [item.name];
-            if (item.type) parts.push(item.type);
-            if (item.owner) parts.push(`持有:${item.owner}`);
-            if (item.status) parts.push(item.status);
-            lines.push(`- ${parts.join(' / ')}`);
+    if (memory.facts?.length) {
+        lines.push('[稳定事实]');
+        for (const fact of memory.facts) {
+            const entity = entitiesById.get(fact.subjectId);
+            const subject = entity?.canonicalName || fact.subjectId;
+            lines.push(`- ${subject}.${fact.predicate}: ${fact.value}`);
         }
     }
 
     if (memory.relationships?.length) {
-        lines.push('[关系]');
-        for (const r of memory.relationships) {
-            lines.push(`- ${r.relKey}: ${r.type}(${r.value})${r.notes ? ' ' + r.notes : ''}`);
+        lines.push('[关系状态]');
+        for (const rel of memory.relationships) {
+            const from = entitiesById.get(rel.fromId)?.canonicalName || rel.fromId;
+            const to = entitiesById.get(rel.toId)?.canonicalName || rel.toId;
+            const parts = [`${from} -> ${to}`, rel.type, String(rel.value ?? '')];
+            if (rel.stableSummary) parts.push(rel.stableSummary);
+            if (rel.recentChange) parts.push(`近期:${rel.recentChange}`);
+            lines.push(`- ${parts.filter(Boolean).join(' / ')}`);
         }
     }
 
-    if (memory.worldLore?.length) {
-        lines.push('[世界观]');
-        for (const w of memory.worldLore) {
-            lines.push(`- ${w.key}(${w.category}): ${w.content}`);
+    if (memory.events?.length) {
+        lines.push('[相关事件摘要]');
+        for (const event of memory.events) {
+            const turn = event.turnStart || event.turnEnd ? `#${event.turnStart || '?'}-${event.turnEnd || '?'}` : '';
+            lines.push(`- ${turn} ${event.summary}`.trim());
         }
     }
 
-    if (memory.relevantChronicle?.length) {
-        lines.push('[相关记忆]');
-        for (const entry of memory.relevantChronicle) {
-            lines.push(`${entry.amCode}: ${entry.summary}`);
-        }
+    if (memory.sceneState) {
+        lines.push('[当前场景]');
+        const s = memory.sceneState;
+        const parts = [];
+        if (s.location) parts.push(`位置:${s.location}`);
+        if (s.time) parts.push(`时间:${s.time}`);
+        if (s.currentActivity) parts.push(`活动:${s.currentActivity}`);
+        if (s.mood) parts.push(`氛围:${s.mood}`);
+        if (s.openThreads) parts.push(`待续:${s.openThreads}`);
+        lines.push(parts.join(' | '));
     }
 
     lines.push('</记忆数据库>');
     return lines.join('\n');
 }
-
 function formatNumber(value) {
     return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : '无';
 }
@@ -2170,15 +2203,15 @@ async function openPanel(activeTab = 'optimizer') {
                         </div>
                         <div class="dco-settings-grid">
                             <label>
-                                <span>最大编年史召回条数</span>
+                                <span>最大事件召回条数</span>
                                 <input id="dco_memory_max_chronicle_modal" class="text_pole" type="number" min="1" max="50" value="${Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle)}" />
                             </label>
                             <label>
-                                <span>最多角色召回条数</span>
+                                <span>最多实体召回条数</span>
                                 <input id="dco_memory_max_characters_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxCharacters ?? defaultSettings.memoryMaxCharacters)}" />
                             </label>
                             <label>
-                                <span>最多物品召回条数</span>
+                                <span>事实召回调节</span>
                                 <input id="dco_memory_max_items_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxItems ?? defaultSettings.memoryMaxItems)}" />
                             </label>
                             <label>
@@ -2186,15 +2219,15 @@ async function openPanel(activeTab = 'optimizer') {
                                 <input id="dco_memory_max_relationships_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxRelationships ?? defaultSettings.memoryMaxRelationships)}" />
                             </label>
                             <label>
-                                <span>最多世界观召回条数</span>
+                                <span>世界/规则实体调节</span>
                                 <input id="dco_memory_max_world_lore_modal" class="text_pole" type="number" min="0" max="30" value="${Number(settings.memoryMaxWorldLore ?? defaultSettings.memoryMaxWorldLore)}" />
                             </label>
                             <label>
-                                <span>常保留最近编年史</span>
+                                <span>常保留最近事件</span>
                                 <input id="dco_memory_recent_chronicle_modal" class="text_pole" type="number" min="0" max="20" value="${Number(settings.memoryRecentChronicle ?? defaultSettings.memoryRecentChronicle)}" />
                             </label>
                             <label>
-                                <span>编年史最低重要度</span>
+                                <span>事件最低重要度</span>
                                 <input id="dco_memory_min_importance_modal" class="text_pole" type="number" min="0" max="1" step="0.05" value="${Number(settings.memoryMinImportance ?? defaultSettings.memoryMinImportance)}" />
                             </label>
                         </div>
@@ -2269,35 +2302,25 @@ async function openPanel(activeTab = 'optimizer') {
                         </div>
                         <div class="dco-muted">最近结果：${lastMemoryExtractorResult ? `${escapeHtml(lastMemoryExtractorResult.at.toLocaleString())}，执行 ${lastMemoryExtractorResult.executed} 条命令` : '暂无'}</div>
                         <div class="dco-muted">直接填写 API Key 会保存在浏览器扩展设置中；多人或公网使用时建议复用 ST 后端密钥。</div>
-                    </section>
-                    <section class="dco-card">
-                        <div class="dco-card-title">当前状态 & 角色信息</div>
+                    </section>                    <section class="dco-card">
+                        <div class="dco-card-title">当前场景</div>
                         <div class="dco-muted" id="dco_table_state_summary">加载中...</div>
                     </section>
                     <section class="dco-card">
-                        <div class="dco-card-title">活跃角色</div>
+                        <div class="dco-card-title">实体</div>
                         <div class="dco-table-wrap">
                             <table class="dco-table">
-                                <thead><tr><th>姓名</th><th>角色</th><th>外貌</th><th>关系</th><th>状态</th><th>特征</th></tr></thead>
-                                <tbody id="dco_characters_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                                <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>描述</th><th>状态</th><th>重要性</th></tr></thead>
+                                <tbody id="dco_entities_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
                     <section class="dco-card">
-                        <div class="dco-card-title">编年史</div>
+                        <div class="dco-card-title">事实</div>
                         <div class="dco-table-wrap">
                             <table class="dco-table">
-                                <thead><tr><th>编号</th><th>事件摘要</th><th>相关人物</th><th>关键词</th><th>轮次</th><th>重要性</th></tr></thead>
-                                <tbody id="dco_chronicle_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
-                            </table>
-                        </div>
-                    </section>
-                    <section class="dco-card">
-                        <div class="dco-card-title">物品</div>
-                        <div class="dco-table-wrap">
-                            <table class="dco-table">
-                                <thead><tr><th>名称</th><th>类型</th><th>持有者</th><th>描述</th><th>位置</th><th>状态</th></tr></thead>
-                                <tbody id="dco_items_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                                <thead><tr><th>主体</th><th>属性</th><th>内容</th><th>类别</th><th>生命周期</th><th>重要性</th></tr></thead>
+                                <tbody id="dco_facts_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
@@ -2305,17 +2328,26 @@ async function openPanel(activeTab = 'optimizer') {
                         <div class="dco-card-title">关系</div>
                         <div class="dco-table-wrap">
                             <table class="dco-table">
-                                <thead><tr><th>关系键</th><th>角色A</th><th>角色B</th><th>类型</th><th>亲密度</th><th>备注</th></tr></thead>
+                                <thead><tr><th>ID</th><th>角色A</th><th>角色B</th><th>类型</th><th>值</th><th>摘要</th></tr></thead>
                                 <tbody id="dco_relationships_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
                     <section class="dco-card">
-                        <div class="dco-card-title">世界观</div>
+                        <div class="dco-card-title">事件</div>
                         <div class="dco-table-wrap">
                             <table class="dco-table">
-                                <thead><tr><th>关键词</th><th>类别</th><th>内容</th></tr></thead>
-                                <tbody id="dco_world_lore_rows"><tr><td colspan="3">暂无数据。</td></tr></tbody>
+                                <thead><tr><th>ID</th><th>摘要</th><th>参与者</th><th>关键词</th><th>轮次</th><th>重要性</th></tr></thead>
+                                <tbody id="dco_events_rows"><tr><td colspan="6">暂无数据。</td></tr></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">整理审计</div>
+                        <div class="dco-table-wrap">
+                            <table class="dco-table">
+                                <thead><tr><th>轮次</th><th>接受</th><th>拒绝</th><th>原因</th><th>时间</th></tr></thead>
+                                <tbody id="dco_audit_rows"><tr><td colspan="5">暂无数据。</td></tr></tbody>
                             </table>
                         </div>
                     </section>
@@ -2412,48 +2444,47 @@ async function openPanel(activeTab = 'optimizer') {
     // Populate table data
     (async () => {
         try {
-            const state = (await getTable('global_state'))[0];
-            const protagonist = (await getTable('protagonist_info'))[0];
-            const userInfo = (await getTable('user_info'))[0];
-            const characters = await getTable('important_characters');
-            const chronicle = await getTable('chronicle');
-            const items = await getTable('items');
+            const scene = (await getTable('scene_state'))[0];
+            const entities = await getTable('entities');
+            const facts = await getTable('facts');
             const relationships = await getTable('relationships');
-            const worldLore = await getTable('world_lore');
+            const events = await getTable('events');
+            const audit = await getTable('memory_audit');
 
             const stateSummary = [];
-            if (state) {
-                if (state.location) stateSummary.push(`位置：${escapeHtml(state.location)}`);
-                if (state.time) stateSummary.push(`时间：${escapeHtml(state.time)}`);
-                if (state.scene) stateSummary.push(`场景：${escapeHtml(state.scene)}`);
-                if (state.atmosphere) stateSummary.push(`氛围：${escapeHtml(state.atmosphere)}`);
-            }
-            if (protagonist) {
-                if (protagonist.name) stateSummary.push(`角色：${escapeHtml(protagonist.name)}`);
-                if (protagonist.appearance) stateSummary.push(`外貌：${escapeHtml(protagonist.appearance)}`);
-                if (protagonist.currentState) stateSummary.push(`状态：${escapeHtml(protagonist.currentState)}`);
-                if (protagonist.traits) stateSummary.push(`特征：${escapeHtml(protagonist.traits)}`);
-            }
-            if (userInfo) {
-                if (userInfo.name) stateSummary.push(`User：${escapeHtml(userInfo.name)}`);
-                if (userInfo.persona) stateSummary.push(`人设：${escapeHtml(userInfo.persona.slice(0, 80))}`);
+            if (scene) {
+                if (scene.location) stateSummary.push(`位置：${escapeHtml(scene.location)}`);
+                if (scene.time) stateSummary.push(`时间：${escapeHtml(scene.time)}`);
+                if (scene.currentActivity) stateSummary.push(`活动：${escapeHtml(scene.currentActivity)}`);
+                if (scene.mood) stateSummary.push(`氛围：${escapeHtml(scene.mood)}`);
+                if (scene.activeEntities) stateSummary.push(`活跃实体：${escapeHtml(scene.activeEntities)}`);
+                if (scene.openThreads) stateSummary.push(`待续：${escapeHtml(scene.openThreads)}`);
             }
             html.find('#dco_table_state_summary').text(stateSummary.length ? stateSummary.join(' | ') : '暂无数据。');
 
-            if (characters.length) {
-                html.find('#dco_characters_rows').html(characters.map(c => `<tr><td>${escapeHtml(c.name || '')}</td><td>${escapeHtml(c.role || '')}</td><td>${escapeHtml(c.appearance || '')}</td><td>${escapeHtml(c.relationship || '')}</td><td>${escapeHtml(c.status || '')}</td><td>${escapeHtml(c.traits || '')}</td></tr>`).join(''));
+            if (entities.length) {
+                html.find('#dco_entities_rows').html(entities
+                    .sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0))
+                    .map(e => `<tr><td>${escapeHtml(e.id || '')}</td><td>${escapeHtml(e.type || '')}</td><td>${escapeHtml(e.canonicalName || '')}</td><td>${escapeHtml(e.description || '')}</td><td>${escapeHtml(e.status || '')}</td><td>${Number(e.importance || 0).toFixed(2)}</td></tr>`).join(''));
             }
-            if (chronicle.length) {
-                html.find('#dco_chronicle_rows').html(chronicle.map(e => `<tr><td>${escapeHtml(e.amCode || '')}</td><td>${escapeHtml(e.summary || '')}</td><td>${escapeHtml(e.entities || '')}</td><td>${escapeHtml(e.keywords || '')}</td><td>${e.turn || ''}</td><td>${Number(e.importance || 0).toFixed(2)}</td></tr>`).join(''));
-            }
-            if (items.length) {
-                html.find('#dco_items_rows').html(items.map(i => `<tr><td>${escapeHtml(i.name || '')}</td><td>${escapeHtml(i.type || '')}</td><td>${escapeHtml(i.owner || '')}</td><td>${escapeHtml(i.description || '')}</td><td>${escapeHtml(i.location || '')}</td><td>${escapeHtml(i.status || '')}</td></tr>`).join(''));
+            if (facts.length) {
+                html.find('#dco_facts_rows').html(facts
+                    .sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0))
+                    .map(f => `<tr><td>${escapeHtml(f.subjectId || '')}</td><td>${escapeHtml(f.predicate || '')}</td><td>${escapeHtml(f.value || '')}</td><td>${escapeHtml(f.category || '')}</td><td>${escapeHtml(f.permanence || '')}</td><td>${Number(f.importance || 0).toFixed(2)}</td></tr>`).join(''));
             }
             if (relationships.length) {
-                html.find('#dco_relationships_rows').html(relationships.map(r => `<tr><td>${escapeHtml(r.relKey || '')}</td><td>${escapeHtml(r.fromChar || '')}</td><td>${escapeHtml(r.toChar || '')}</td><td>${escapeHtml(r.type || '')}</td><td>${r.value ?? ''}</td><td>${escapeHtml(r.notes || '')}</td></tr>`).join(''));
+                html.find('#dco_relationships_rows').html(relationships.map(r => `<tr><td>${escapeHtml(r.id || '')}</td><td>${escapeHtml(r.fromId || '')}</td><td>${escapeHtml(r.toId || '')}</td><td>${escapeHtml(r.type || '')}</td><td>${r.value ?? ''}</td><td>${escapeHtml([r.stableSummary, r.recentChange].filter(Boolean).join(' / '))}</td></tr>`).join(''));
             }
-            if (worldLore.length) {
-                html.find('#dco_world_lore_rows').html(worldLore.map(w => `<tr><td>${escapeHtml(w.key || '')}</td><td>${escapeHtml(w.category || '')}</td><td>${escapeHtml(w.content || '')}</td></tr>`).join(''));
+            if (events.length) {
+                html.find('#dco_events_rows').html(events
+                    .sort((a, b) => Number(b.turnEnd || 0) - Number(a.turnEnd || 0))
+                    .map(e => `<tr><td>${escapeHtml(e.id || '')}</td><td>${escapeHtml(e.summary || '')}</td><td>${escapeHtml(e.participants || '')}</td><td>${escapeHtml(e.keywords || '')}</td><td>${escapeHtml(`${e.turnStart || ''}-${e.turnEnd || ''}`)}</td><td>${Number(e.importance || 0).toFixed(2)}</td></tr>`).join(''));
+            }
+            if (audit.length) {
+                html.find('#dco_audit_rows').html(audit
+                    .sort((a, b) => Number(b.turn || 0) - Number(a.turn || 0))
+                    .slice(0, 20)
+                    .map(a => `<tr><td>${a.turn || ''}</td><td>${escapeHtml(a.acceptedOps || '')}</td><td>${escapeHtml(a.rejectedOps || '')}</td><td>${escapeHtml(a.reason || '')}</td><td>${escapeHtml(a.createdAt || '')}</td></tr>`).join(''));
             }
         } catch (e) {
             console.warn('[DeepSeek Cache Optimizer] Failed to load table data for panel', e);
@@ -2601,3 +2632,11 @@ export function init() {
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, optimizeChatCompletionPrompt);
     eventSource.on(event_types.CHAT_COMPLETION_RESPONSE_USAGE, handleBackendUsage);
 }
+
+
+
+
+
+
+
+
