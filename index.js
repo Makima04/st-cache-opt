@@ -1694,13 +1694,27 @@ async function callExtensionUpdateApi(endpoint, { global = false } = {}) {
     return data;
 }
 
+async function callExtensionUpdateApiAuto(endpoint) {
+    try {
+        const data = await callExtensionUpdateApi(endpoint, { global: false });
+        return { ...data, installScope: 'local' };
+    } catch (localError) {
+        const localMessage = localError.message || String(localError);
+        if (!/Directory does not exist|does not exist/i.test(localMessage)) {
+            throw localError;
+        }
+        const data = await callExtensionUpdateApi(endpoint, { global: true });
+        return { ...data, installScope: 'global' };
+    }
+}
+
 function formatCommit(value) {
     return value ? String(value).slice(0, 7) : '未知';
 }
 
 async function checkSelfUpdate({ quiet = false } = {}) {
     try {
-        const data = await callExtensionUpdateApi('version');
+        const data = await callExtensionUpdateApiAuto('version');
         lastUpdateCheck = {
             at: new Date(),
             ...data,
@@ -1732,7 +1746,7 @@ async function updateSelfExtension() {
     updateStats();
 
     try {
-        const data = await callExtensionUpdateApi('update');
+        const data = await callExtensionUpdateApiAuto('update');
         lastUpdateCheck = {
             at: new Date(),
             ...data,
@@ -1767,9 +1781,10 @@ function getUpdateStatusText() {
     const time = lastUpdateCheck.at?.toLocaleString?.() || '未知时间';
     const branch = lastUpdateCheck.currentBranchName || '未知分支';
     const commit = formatCommit(lastUpdateCheck.currentCommitHash || lastUpdateCheck.shortCommitHash);
+    const scope = lastUpdateCheck.installScope ? `；位置：${lastUpdateCheck.installScope}` : '';
     const remote = lastUpdateCheck.remoteUrl ? `；来源：${lastUpdateCheck.remoteUrl}` : '';
     const state = lastUpdateCheck.isUpToDate === false ? '有可用更新' : '已是最新';
-    return `${state}；${branch}-${commit}；检查时间：${time}${remote}`;
+    return `${state}；${branch}-${commit}${scope}；检查时间：${time}${remote}`;
 }
 
 async function fetchExtractorModels(settings) {
