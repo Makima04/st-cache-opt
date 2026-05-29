@@ -10,15 +10,15 @@ import {
     name2,
     saveSettingsDebounced,
     this_chid,
-} from '../../../script.js';
-import { extension_settings } from '../../extensions.js';
-import { chat_completion_sources, getChatCompletionModel, model_list, oai_settings } from '../../openai.js';
-import { POPUP_TYPE, callGenericPopup } from '../../popup.js';
+} from '/script.js';
+import { extension_settings } from '/scripts/extensions.js';
+import { chat_completion_sources, getChatCompletionModel, model_list, oai_settings } from '/scripts/openai.js';
+import { POPUP_TYPE, callGenericPopup } from '/scripts/popup.js';
 import {
     selected_world_info,
     world_info,
-} from '../../world-info.js';
-import { power_user } from '../../power-user.js';
+} from '/scripts/world-info.js';
+import { power_user } from '/scripts/power-user.js';
 
 const MODULE_NAME = 'deepseek_cache_optimizer';
 const EXTENSION_FOLDER_NAME = 'st-cache-opt';
