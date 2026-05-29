@@ -416,19 +416,23 @@ function stripExtractionNoise(text) {
         .trim();
 }
 
-function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
-    const transcript = turns.map(item => {
+function buildMemoryExtractionTranscript(turns) {
+    return turns.map(item => {
         const speaker = item.message?.is_user ? name1 || 'User' : name2 || 'Assistant';
         const raw = item.message?.mes || item.message?.message || item.message?.content || '';
         const text = stripExtractionNoise(raw);
         return text ? `#${item.index} ${speaker}: ${text}` : '';
     }).filter(Boolean).join('\n');
+}
 
-    const tableState = buildTableStateSnapshot(tableData);
-
-    return [
+function buildMemoryExtractionStaticMessages() {
+    const rolePrompt = [
         '你是【填表AI】，负责根据聊天片段对记忆数据库执行增删改操作。',
-        '',
+        '只输出 <tableEdit>...</tableEdit> 命令块，不要输出解释、寒暄或 Markdown。',
+        '只提取对后续剧情有持久影响的信息；忽略临时动作、无意义寒暄和样式代码。',
+    ].join('\n');
+
+    const schemaPrompt = [
         '## 表结构',
         '- global_state: location(位置), time(时间), scene(场景), atmosphere(氛围)',
         '- protagonist_info: name(姓名), appearance(外貌描述), personality(性格), currentState(当前状态), background(背景), traits(特征逗号分隔), abilities(能力逗号分隔)',
@@ -438,7 +442,9 @@ function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
         '- items: name(名称), type(类型如武器/道具/食物), owner(持有者), description(描述), location(所在位置), status(状态如正常/损坏)',
         '- relationships: relKey(关系键如"A→B"), fromChar(角色A), toChar(角色B), type(关系类型), value(亲密度-1到1), notes(备注)',
         '- world_lore: key(关键词), category(类别如规则/地点/组织), content(内容描述)',
-        '',
+    ].join('\n');
+
+    const commandPrompt = [
         '## 命令格式',
         '将所有命令写在 <tableEdit> 和 </tableEdit> 之间，每行一条：',
         '<tableEdit>',
@@ -454,9 +460,10 @@ function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
         '4. chronicle 只用 insertRow，不需要指定 amCode（自动生成）',
         '5. 外貌描写必须详细（发型、瞳色、体型、服饰、特征等），不能只写一个词',
         '6. summary 必须是简洁的一句话总结（≤50字），不是原文复制',
-        '7. 只提取对后续剧情有持久影响的信息',
-        '8. important_characters 必须包含 User 角色（扮演的用户身份，不是 AI 助手）',
-        '',
+        '7. important_characters 必须包含 User 角色（扮演的用户身份，不是 AI 助手）',
+    ].join('\n');
+
+    const examplePrompt = [
         '## 示例输出',
         '<tableEdit>',
         'updateRow("global_state", "singleton", {"location":"酒馆二楼","time":"深夜","scene":"密谈","atmosphere":"紧张"})',
@@ -467,17 +474,41 @@ function buildMemoryExtractionPrompt(turns, worldTerms, tableData) {
         'insertRow("world_lore", {"key":"空庭","category":"地点","content":"一个被魔法封锁的异空间，有严格的规则体系"})',
         'insertRow("chronicle", {"summary":"主角与艾莉丝达成秘密协议","entities":"主角,艾莉丝","keywords":"协议,密谋","importance":0.8})',
         '</tableEdit>',
-        '',
-        `当前角色：${name2 || '未知'}；用户：${name1 || '未知'}。`,
-        `世界书关键词：${worldTerms.slice(0, 40).join(', ') || '无'}`,
-        '',
-        '## 当前数据库状态',
-        tableState || '（空）',
-        '',
-        '--- 聊天片段 ---',
-        transcript,
-        '--- 片段结束 ---',
     ].join('\n');
+
+    return [
+        { role: 'system', content: rolePrompt },
+        { role: 'system', content: schemaPrompt },
+        { role: 'system', content: commandPrompt },
+        { role: 'system', content: examplePrompt },
+    ];
+}
+
+function buildMemoryExtractionDynamicMessage(turns, worldTerms, tableData) {
+    const transcript = buildMemoryExtractionTranscript(turns);
+    const tableState = buildTableStateSnapshot(tableData);
+
+    return {
+        role: 'user',
+        content: [
+            `当前角色：${name2 || '未知'}；用户：${name1 || '未知'}。`,
+            `世界书关键词：${worldTerms.slice(0, 40).join(', ') || '无'}`,
+            '',
+            '## 当前数据库状态',
+            tableState || '（空）',
+            '',
+            '--- 聊天片段 ---',
+            transcript,
+            '--- 片段结束 ---',
+        ].join('\n'),
+    };
+}
+
+function buildMemoryExtractionMessages(turns, worldTerms, tableData) {
+    return [
+        ...buildMemoryExtractionStaticMessages(),
+        buildMemoryExtractionDynamicMessage(turns, worldTerms, tableData),
+    ];
 }
 
 function buildTableStateSnapshot(tableData) {
@@ -650,7 +681,7 @@ function getExtractorSource(settings) {
         : settings.memoryLlmSource;
 }
 
-async function callMemoryExtractorViaSt(prompt, settings) {
+async function callMemoryExtractorViaSt(messages, settings) {
     const source = getExtractorSource(settings);
     // Build custom_include_body with thinking disabled (for DeepSeek via Custom/NewAPI)
     // mergeObjectWithYaml() expects a YAML/JSON *string*, not an object
@@ -663,10 +694,7 @@ async function callMemoryExtractorViaSt(prompt, settings) {
         } catch { /* ignore parse errors */ }
     }
     const payload = {
-        messages: [
-            { role: 'system', content: '你是一个助手，负责听从用户的指令完成你的工作。' },
-            { role: 'user', content: prompt },
-        ],
+        messages,
         model: getExtractorModel(settings),
         chat_completion_source: source,
         include_reasoning: false,
@@ -704,7 +732,7 @@ async function callMemoryExtractorViaSt(prompt, settings) {
     return { content: content || '', reasoning: reasoning || '' };
 }
 
-async function callMemoryExtractorDirect(prompt, settings) {
+async function callMemoryExtractorDirect(messages, settings) {
     const apiUrl = String(settings.memoryLlmApiUrl || '').trim().replace(/\/+$/, '');
     const apiKey = String(settings.memoryLlmApiKey || '').trim();
     const model = getExtractorModel(settings);
@@ -724,10 +752,7 @@ async function callMemoryExtractorDirect(prompt, settings) {
             max_tokens: Number(settings.memoryLlmMaxTokens || defaultSettings.memoryLlmMaxTokens),
             stream: false,
             thinking: { type: 'disabled' },
-            messages: [
-                { role: 'system', content: '你是一个助手，负责听从用户的指令完成你的工作。' },
-                { role: 'user', content: prompt },
-            ],
+            messages,
         }),
     });
 
@@ -783,10 +808,10 @@ async function runMemoryLlmExtraction({ manual = false } = {}) {
             relationships: await getTable('relationships'),
             worldLore: await getTable('world_lore'),
         };
-        const prompt = buildMemoryExtractionPrompt(turns, worldTerms, tableData);
+        const extractionMessages = buildMemoryExtractionMessages(turns, worldTerms, tableData);
         const result = settings.memoryLlmProvider === 'direct'
-            ? await callMemoryExtractorDirect(prompt, settings)
-            : await callMemoryExtractorViaSt(prompt, settings);
+            ? await callMemoryExtractorDirect(extractionMessages, settings)
+            : await callMemoryExtractorViaSt(extractionMessages, settings);
 
         // Try content first, fallback to reasoning (when reasoning tokens exhaust budget)
         let rawContent = result.content || '';
