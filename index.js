@@ -19,6 +19,7 @@ import {
     world_info,
 } from '/scripts/world-info.js';
 import { power_user } from '/scripts/power-user.js';
+import { getGroupNames } from '/scripts/group-chats.js';
 
 const MODULE_NAME = 'deepseek_cache_optimizer';
 const EXTENSION_FOLDER_NAME = 'st-cache-opt';
@@ -56,6 +57,10 @@ const defaultSettings = {
 
 const DB_NAME = 'deepseek-cache-optimizer-memory';
 const DB_VERSION = 5;
+const HISTORY_DB_NAME = 'dco-request-history';
+const HISTORY_DB_VERSION = 1;
+const HISTORY_STORE = 'snapshots';
+const HISTORY_MAX = 30;
 const MEMORY_INJECTION_MARKER = '<记忆数据库>';
 
 const TABLE_SCHEMAS = {
@@ -160,19 +165,23 @@ let lastStats = {
     total: 0,
     skipped: '尚未运行',
     protected: 0,
-    prefixChars: 0,
-    prefixPercent: 0,
+    rawPrefixChars: 0,
+    rawPrefixPercent: 0,
+    rawInputPercent: 0,
+    pluginImpact: 0,
     firstChangedMessage: null,
     firstMessageHash: '',
 };
 
 let previousSerializedPrompt = '';
-let previousHistoryOnlySerialized = '';
+let previousRawContent = '';
+let previousRawInput = '';
 let previousMessageSignatures = [];
 let lastBackendUsage = null;
 let lastGenerationSettings = null;
 let promptRunCounter = 0;
 let usageHistory = [];
+let requestHistory = [];
 let dbPromise = null;
 let lastRecallResults = [];
 let lastWorldInfoTerms = [];
@@ -180,8 +189,12 @@ let lastPromptAnalysis = [];
 let memoryExtractorRunning = false;
 let memoryExtractorStatus = '尚未运行';
 let lastMemoryExtractorResult = null;
+let previousMergedContent = '';
+let previousMergedSignatures = [];
+let mergeAwareAvailable = true;
 let lastUpdateCheck = null;
 let updateRunning = false;
+let backendBodyRecords = [];
 
 const promptCategoryLabels = {
     stable_rule: '稳定规则',
@@ -260,6 +273,21 @@ function serializeMessage(message) {
     });
 }
 
+function serializeRawContent(messages) {
+    return messages.map(msg => getMessageText(msg)).join('\n');
+}
+
+function serializeMessagesAsJson(messages) {
+    const formatted = messages.map(msg => {
+        const obj = { role: msg.role || '', content: msg.content ?? '' };
+        if (msg.name) obj.name = msg.name;
+        if (msg.tool_calls) obj.tool_calls = msg.tool_calls;
+        if (msg.tool_call_id) obj.tool_call_id = msg.tool_call_id;
+        return obj;
+    });
+    return JSON.stringify({ messages: formatted });
+}
+
 function getCommonPrefixLength(a, b) {
     const max = Math.min(a.length, b.length);
     let index = 0;
@@ -321,6 +349,97 @@ function openMemoryDb() {
         request.onerror = () => reject(request.error);
     });
     return dbPromise;
+}
+
+let historyDbPromise = null;
+function openHistoryDb() {
+    if (historyDbPromise) return historyDbPromise;
+    historyDbPromise = new Promise((resolve, reject) => {
+        const req = indexedDB.open(HISTORY_DB_NAME, HISTORY_DB_VERSION);
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+                db.createObjectStore(HISTORY_STORE, { keyPath: 'id' });
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+    return historyDbPromise;
+}
+
+async function saveSnapshotToDb(record) {
+    try {
+        const db = await openHistoryDb();
+        const messages = (record.messages || []).map((msg, i) => ({
+            index: i,
+            role: msg?.role ?? '',
+            name: msg?.name ?? '',
+            content: getMessageText(msg),
+            hash: hashString(serializeMessage(msg)),
+        }));
+        const snapshot = {
+            id: record.id,
+            at: record.at,
+            model: record.model,
+            usage: record.usage,
+            stats: record.stats,
+            messageCount: messages.length,
+            messages,
+        };
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(HISTORY_STORE, 'readwrite');
+            tx.objectStore(HISTORY_STORE).put(snapshot);
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+        });
+        // Trim old entries
+        const all = await new Promise((resolve, reject) => {
+            const tx = db.transaction(HISTORY_STORE, 'readwrite');
+            const store = tx.objectStore(HISTORY_STORE);
+            const req = store.getAllKeys();
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+        if (all.length > HISTORY_MAX) {
+            const toDelete = all.slice(0, all.length - HISTORY_MAX);
+            const tx = db.transaction(HISTORY_STORE, 'readwrite');
+            const store = tx.objectStore(HISTORY_STORE);
+            for (const key of toDelete) store.delete(key);
+        }
+    } catch (e) {
+        console.warn('[DCO] saveSnapshotToDb failed:', e);
+    }
+}
+
+async function loadSnapshotsFromDb() {
+    try {
+        const db = await openHistoryDb();
+        return await new Promise((resolve, reject) => {
+            const tx = db.transaction(HISTORY_STORE, 'readonly');
+            const req = tx.objectStore(HISTORY_STORE).getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
+        });
+    } catch {
+        return [];
+    }
+}
+
+async function exportAllSnapshots() {
+    const snapshots = await loadSnapshotsFromDb();
+    if (!snapshots.length) {
+        toastr.warning('没有已保存的快照');
+        return;
+    }
+    const blob = new Blob([JSON.stringify(snapshots, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dco-all-snapshots-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toastr.success(`已导出 ${snapshots.length} 条快照`);
 }
 
 async function getTable(tableName) {
@@ -585,33 +704,57 @@ function buildMemoryExtractionStaticMessages() {
         '## 命令格式',
         '将所有命令写在 <tableEdit> 和 </tableEdit> 之间，每行一条：',
         '<tableEdit>',
-        'insertRow("table_name", {"col":"val",...})',
-        'updateRow("table_name", "key_value", {"col":"val",...})',
-        'deleteRow("table_name", "key_value")',
+        'insertRow(“table_name”, {“col”:”val”,...})',
+        'updateRow(“table_name”, “key_value”, {“col”:”val”,...})',
+        'deleteRow(“table_name”, “key_value”)',
         '</tableEdit>',
         '',
+        '## 决策流程（必须严格遵守，这是最重要的规则）',
+        '第一步：逐条阅读「当前数据库状态」中已有的实体、事实、关系、事件。',
+        '第二步：对每条候选记忆，按以下顺序判断：',
+        '  (a) 已有完全相同的实体/事实/关系？ → updateRow，使用已有的 id，只更新变化的字段',
+        '  (b) 已有相同 subjectId + predicate 的事实？ → updateRow 覆盖旧值，不要 insertRow 新行',
+        '  (c) 已有相同 fromId + toId 的关系？ → updateRow，不要 insertRow 新行',
+        '  (d) 已过时、不再适用的数据？ → deleteRow',
+        '  (e) 全新数据，数据库中不存在？ → insertRow',
+        '  (f) 无变化？ → 不输出任何命令',
+        '第三步：检查输出中是否有重复，同一 id 不得出现两次 insertRow。',
+        '',
         '## 写入规则',
-        '1. scene_state 始终用 updateRow("scene_state", "singleton", {...})。',
-        '2. 实体必须使用稳定 id：character:姓名、place:地点、item:物品、rule:规则名、concept:概念。禁止把 singleton/unknown/null 当成实体名。',
-        '3. 同一人、同一地点、同一物品必须复用已有实体 id；别名写 aliases，不要重复 insert。',
-        '4. 角色外貌、性格、背景、能力、规则、稳定身份写 facts；当前姿势、表情、一次性动作不要写 facts。',
-        '5. 关系表只写稳定关系与最近变化，不要把完整事件流水塞进 stableSummary。',
-        '6. events 只写有长期意义的事件。重复事件要 update 旧事件，合并 summary/turnEnd/mergedFrom，不要新增相似流水账。',
-        '7. 日常训练、吃饭、洗澡、拥抱、奖励等若没有长期后果，importance 最高 0.45；规则变化、身份变化、关系转折、长期伏笔可为 0.7 以上。',
-        '8. 已使用、已消耗、离开当前场景的临时物品写 temporary fact 或直接忽略，不要长期保留。',
-        '9. 每次输出最后必须插入一条 memory_audit，记录本次接受/拒绝/合并原因。',
-        '10. 如果没有值得写入的长期记忆，只输出 memory_audit，reason 写“无长期记忆变化”。',
+        '1. scene_state 始终用 updateRow(“scene_state”, “singleton”, {...})。',
+        '2. 实体必须使用稳定 id：character:姓名、place:地点、item:物品、rule:规则名。禁止把 singleton/unknown/null 当成实体名。',
+        '3. 同一人、同一地点、同一物品必须复用已有实体 id（从「当前数据库状态」中查找）；别名写 aliases，不要重复 insert。',
+        '4. concept 类型仅用于抽象世界观概念（如魔法体系规则），禁止为 character/place/item 创建 concept:character:* 或 concept:place:* 副本。',
+        '5. 角色外貌、性格、背景、能力、规则、稳定身份写 facts；当前姿势、表情、一次性动作不要写 facts。',
+        '6. 同一 subjectId + predicate 的事实只能有一行。如果已有 character:浅野堇 predicate=personality 的事实，用 updateRow 更新它，不要新增。',
+        '7. status 类事实：如果 permanence=session，新阶段开始时必须先 deleteRow 旧的 session status，再 insertRow 新的。',
+        '8. 关系表只写稳定关系与最近变化，不要把完整事件流水塞进 stableSummary。',
+        '9. events 只写有长期意义的事件。重复事件要 update 旧事件，合并 summary/turnEnd/mergedFrom，不要新增相似流水账。',
+        '10. 日常训练、吃饭、洗澡、拥抱、奖励等若没有长期后果，importance 最高 0.45；规则变化、身份变化、关系转折、长期伏笔可为 0.7 以上。',
+        '11. 已使用、已消耗、离开当前场景的临时物品写 temporary fact 或直接忽略，不要长期保留。',
+        '12. 每次输出最后必须插入一条 memory_audit，记录本次接受/拒绝/合并原因。',
+        '13. 如果没有值得写入的长期记忆，只输出 memory_audit，reason 写”无长期记忆变化”。',
     ].join('\n');
 
     const examplePrompt = [
-        '## 示例输出',
+        '## 示例（展示 updateRow 和 deleteRow 的正确用法）',
         '<tableEdit>',
-        'updateRow("scene_state", "singleton", {"location":"月泉浴室","time":"夜晚","currentActivity":"共浴后交谈","mood":"放松但暧昧","activeEntities":"character:时幼微,character:浅野堇,place:月泉","openThreads":"浅野堇对依赖感仍嘴硬"})',
-        'insertRow("entities", {"id":"character:时幼微","type":"character","canonicalName":"时幼微","aliases":"魔女,主人","description":"三千年阅历的魔女，掌控欲强但温柔狡黠","status":"在场","importance":0.95,"confidence":0.95,"firstTurn":1,"lastTurn":35})',
-        'insertRow("facts", {"id":"fact:character:时幼微:appearance","subjectId":"character:时幼微","predicate":"appearance","value":"墨色长发，紫罗兰色眼眸，常穿白色棉质T恤和运动短裙","category":"appearance","permanence":"stable","confidence":0.85,"importance":0.75,"sourceTurns":"1-35"})',
-        'updateRow("relationships", "rel:character:时幼微->character:浅野堇", {"id":"rel:character:时幼微->character:浅野堇","fromId":"character:时幼微","toId":"character:浅野堇","type":"主人与宠物","value":0.75,"stableSummary":"时幼微主导关系，浅野堇开始主动亲近但仍嘴硬","recentChange":"浅野堇训练后主动求抱，依赖感上升","confidence":0.85})',
-        'insertRow("events", {"id":"event:训练后主动求抱","summary":"浅野堇多次在训练后主动求抱，时幼微用拥抱和奖励回应，双方依赖感上升。","participants":"character:浅野堇,character:时幼微","locationId":"place:伊甸","keywords":"训练,求抱,奖励,依赖","turnStart":21,"turnEnd":31,"importance":0.55,"noveltyHash":"训练求抱奖励依赖","mergedFrom":"AM0002,AM0003,AM0005","status":"active"})',
-        'insertRow("memory_audit", {"id":"audit:35","turn":35,"rawProposal":"抽取近期训练、共浴与关系变化","acceptedOps":"更新场景;合并训练求抱事件;更新关系","rejectedOps":"未保留已使用矿泉水;未重复新增相似训练事件","reason":"保留长期关系变化，过滤临时流水账","createdAt":"now"})',
+        '// 更新已有场景（singleton 表始终 update）',
+        'updateRow(“scene_state”, “singleton”, {“location”:”月泉浴室”,”time”:”夜晚”,”currentActivity”:”共浴后交谈”,”mood”:”放松但暧昧”,”activeEntities”:”character:时幼微,character:浅野堇,place:月泉”,”openThreads”:”浅野堇对依赖感仍嘴硬”})',
+        '// 实体已存在 → updateRow 而不是 insertRow',
+        'updateRow(“entities”, “character:时幼微”, {“description”:”三千年阅历的魔女，掌控欲强但温柔狡黠，目前在月泉”,”status”:”在场”,”lastTurn”:35})',
+        '// 事实已存在（同一 subjectId+predicate）→ updateRow 覆盖',
+        'updateRow(“facts”, “fact:character:时幼微:appearance”, {“value”:”墨色长发，紫罗兰色眼眸，常穿白色棉质T恤和运动短裙”,”confidence”:0.85,”sourceTurns”:”1-35”})',
+        '// 删除过时的 session status',
+        'deleteRow(“facts”, “fact:character:浅野堇:status”)',
+        '// 新 session status',
+        'insertRow(“facts”, {“id”:”fact:character:浅野堇:status”,”subjectId”:”character:浅野堇”,”predicate”:”status”,”value”:”刚结束共浴，全身放松”,”category”:”status”,”permanence”:”session”,”confidence”:0.9,”importance”:0.4,”sourceTurns”:”35”})',
+        '// 关系已存在 → updateRow',
+        'updateRow(“relationships”, “rel:character:时幼微->character:浅野堇”, {“value”:0.75,”stableSummary”:”时幼微主导关系，浅野堇开始主动亲近但仍嘴硬”,”recentChange”:”浅野堇训练后主动求抱，依赖感上升”,”confidence”:0.85})',
+        '// 事件可以合并 → updateRow',
+        'updateRow(“events”, “event:训练后主动求抱”, {“summary”:”浅野堇多次在训练后主动求抱，时幼微用拥抱和奖励回应，双方依赖感上升。”,”turnEnd”:35,”mergedFrom”:”AM0002,AM0003,AM0005”,”importance”:0.55})',
+        '// 审计记录',
+        'insertRow(“memory_audit”, {“id”:”audit:35”,”turn”:35,”rawProposal”:”抽取近期训练、共浴与关系变化”,”acceptedOps”:”更新场景;更新时幼微实体;更新外貌事实;删除旧status;新增新status;更新关系;合并事件”,”rejectedOps”:”未重复新增已存在实体;未保留临时动作”,”reason”:”已有数据用updateRow覆盖，旧session status已删除”,”createdAt”:”now”})',
         '</tableEdit>',
     ].join('\n');
 
@@ -735,6 +878,10 @@ function normalizeMemoryRow(tableName, data, keyValue = '') {
         const name = row.canonicalName || keyValue || row.id;
         if (isInvalidEntityName(name)) return null;
         row.type = String(row.type || 'concept').toLowerCase();
+        // Filter redundant concept entities that duplicate character/place/item
+        if (row.type === 'concept' && /^concept:(character|place|item):/i.test(row.id || name)) {
+            return null;
+        }
         row.canonicalName = normalizeText(name);
         row.id = row.id || makeMemoryId(row.type, row.canonicalName);
         if (isInvalidEntityName(row.id)) return null;
@@ -830,6 +977,19 @@ async function upsertMemoryRow(tableName, row, keyValue = '') {
         }
     }
 
+    // Status auto-expiry: delete old session status facts for the same subject
+    if (tableName === 'facts' && normalized.predicate === 'status' && normalized.permanence === 'session') {
+        const stale = existing.filter(item =>
+            item.subjectId === normalized.subjectId &&
+            item.predicate === 'status' &&
+            item.permanence === 'session' &&
+            item.id !== normalized.id,
+        );
+        for (const item of stale) {
+            await deleteRow(tableName, item.id);
+        }
+    }
+
     const key = normalized[keyCol] || keyValue;
     const target = existing.find(item => item[keyCol] === key);
     if (target) {
@@ -846,17 +1006,39 @@ function mergeListStrings(a, b) {
 
 async function executeTableCommands(commands) {
     let executed = 0;
+    // Cache existing rows per table to avoid repeated reads
+    const existingCache = {};
+    const getExisting = async (table) => {
+        if (!existingCache[table]) existingCache[table] = await getTable(table);
+        return existingCache[table];
+    };
+
     for (const cmd of commands) {
         try {
             const schema = TABLE_SCHEMAS[cmd.table];
             if (!schema) continue;
 
             if (cmd.action === 'insertRow') {
+                // Anti-duplicate: if key already exists, merge as update instead
+                if (!schema.singleton && schema.keyColumn) {
+                    const key = cmd.data?.[schema.keyColumn];
+                    if (key) {
+                        const existing = await getExisting(cmd.table);
+                        const found = existing.find(row => row[schema.keyColumn] === key);
+                        if (found) {
+                            await putRow(cmd.table, { ...found, ...cmd.data });
+                            executed++;
+                            continue;
+                        }
+                    }
+                }
                 if (await upsertMemoryRow(cmd.table, cmd.data)) executed++;
             } else if (cmd.action === 'updateRow') {
                 if (await upsertMemoryRow(cmd.table, cmd.data, cmd.keyValue)) executed++;
             } else if (cmd.action === 'deleteRow') {
                 await deleteRow(cmd.table, cmd.keyValue);
+                // Invalidate cache for this table
+                delete existingCache[cmd.table];
                 executed++;
             }
         } catch (e) {
@@ -1263,6 +1445,459 @@ function getBackendUsageMetrics() {
     return getUsageMetrics(lastBackendUsage?.usage);
 }
 
+function clonePromptMessages(messages) {
+    return (messages || []).map(message => JSON.parse(JSON.stringify({
+        role: message?.role ?? '',
+        name: message?.name ?? '',
+        content: message?.content ?? '',
+        tool_calls: message?.tool_calls ?? null,
+        tool_call_id: message?.tool_call_id ?? '',
+    })));
+}
+
+function makeRequestRecord({ messages, stats, analysis, serializedPrompt, mergedMessages: merged }) {
+    const signatures = getMessageSignatures(messages);
+    return {
+        id: `REQ-${String(promptRunCounter).padStart(4, '0')}`,
+        runId: promptRunCounter,
+        at: new Date(),
+        status: '等待 usage',
+        usageReceived: false,
+        source: lastGenerationSettings?.source || '',
+        model: lastGenerationSettings?.model || '',
+        stream: Boolean(lastGenerationSettings?.stream),
+        type: lastGenerationSettings?.type || '',
+        stats: structuredClone(stats),
+        analysis: structuredClone(analysis || []),
+        messages: clonePromptMessages(messages),
+        messageSignatures: signatures,
+        serializedPrompt,
+        usage: null,
+        mergedMessageSignatures: merged ? getMessageSignatures(merged) : null,
+        mergedMessageCount: merged?.length ?? null,
+    };
+}
+
+function rememberRequestRecord(record) {
+    requestHistory.unshift(record);
+    requestHistory = requestHistory.slice(0, 50);
+    saveSnapshotToDb(record);
+}
+
+function updateLatestRequestWithUsage(eventData) {
+    const record = requestHistory.find(item => !item.usageReceived);
+    if (!record) {
+        return null;
+    }
+
+    record.usage = eventData.usage;
+    record.usageReceived = true;
+    record.status = '已收到 usage';
+    record.source = eventData.source || record.source;
+    record.model = eventData.model || record.model;
+    record.stream = Boolean(eventData.stream);
+    record.type = eventData.type || record.type;
+    record.usageAt = new Date();
+    record.settingsSignature = getRequestSettingsSignature(lastGenerationSettings);
+    return record;
+}
+
+function getRequestOptionRows(selectedId = '') {
+    return requestHistory.map(record => {
+        const metrics = getUsageMetrics(record.usage);
+        const label = [
+            record.id,
+            record.at?.toLocaleTimeString?.() || '',
+            record.model || '未知模型',
+            record.stream ? '流式' : '非流式',
+            record.usageReceived ? `命中 ${formatNumber(metrics.cachedTokens)}` : '未收到 usage',
+        ].filter(Boolean).join(' / ');
+        return `<option value="${escapeHtml(record.id)}" ${record.id === selectedId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
+}
+
+function getRequestById(id) {
+    return requestHistory.find(record => record.id === id) || null;
+}
+
+function getDefaultCompareIds() {
+    return {
+        leftId: requestHistory[1]?.id || requestHistory[0]?.id || '',
+        rightId: requestHistory[0]?.id || '',
+    };
+}
+
+function getMessageDiffReport(leftId = '', rightId = '') {
+    const left = getRequestById(leftId) || requestHistory[1] || null;
+    const right = getRequestById(rightId) || requestHistory[0] || null;
+    if (!left || !right) {
+        return '至少需要两条请求记录才能对比。';
+    }
+
+    const leftSignatures = left.messageSignatures || getMessageSignatures(left.messages || []);
+    const rightSignatures = right.messageSignatures || getMessageSignatures(right.messages || []);
+    const firstChanged = getFirstChangedMessage(rightSignatures, leftSignatures);
+    const max = Math.max(leftSignatures.length, rightSignatures.length);
+    const changed = [];
+
+    for (let index = 0; index < max; index++) {
+        const a = leftSignatures[index];
+        const b = rightSignatures[index];
+        if (!a || !b || a.hash !== b.hash || a.role !== b.role) {
+            changed.push({ index, before: a, after: b });
+        }
+        if (changed.length >= 12) break;
+    }
+
+    const leftMetrics = getUsageMetrics(left.usage);
+    const rightMetrics = getUsageMetrics(right.usage);
+    const lines = [
+        `对比：${left.id} -> ${right.id}`,
+        `时间：${left.at?.toLocaleString?.() || ''} -> ${right.at?.toLocaleString?.() || ''}`,
+        `模型：${left.model || '未知'} -> ${right.model || '未知'}；模式：${left.stream ? '流式' : '非流式'} -> ${right.stream ? '流式' : '非流式'}`,
+        `usage：${left.usageReceived ? '已收到' : '未收到'} -> ${right.usageReceived ? '已收到' : '未收到'}`,
+        `后端命中：${formatNumber(leftMetrics.cachedTokens)} / ${formatNumber(leftMetrics.promptTokens)} -> ${formatNumber(rightMetrics.cachedTokens)} / ${formatNumber(rightMetrics.promptTokens)}`,
+        `最终前缀：${left.stats?.rawPrefixPercent ?? 0}% -> ${right.stats?.rawPrefixPercent ?? 0}%`,
+        `插件影响：${left.stats?.pluginImpact ?? 0}% -> ${right.stats?.pluginImpact ?? 0}%`,
+        `第一条变化消息：${firstChanged === null ? '无' : firstChanged}`,
+        '',
+        '变化消息摘要：',
+    ];
+
+    if (!changed.length) {
+        lines.push('未发现消息级 hash 差异。');
+    } else {
+        for (const item of changed) {
+            lines.push(`- #${item.index}`);
+            lines.push(`  前：${item.before ? `${item.before.role} len=${item.before.length} hash=${item.before.hash} ${item.before.preview}` : '<不存在>'}`);
+            lines.push(`  后：${item.after ? `${item.after.role} len=${item.after.length} hash=${item.after.hash} ${item.after.preview}` : '<不存在>'}`);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+function getRequestJson(record = requestHistory[0]) {
+    if (!record) {
+        return '';
+    }
+
+    return JSON.stringify({
+        id: record.id,
+        at: record.at,
+        model: record.model,
+        stream: record.stream,
+        status: record.status,
+        usage: record.usage,
+        stats: record.stats,
+        messages: record.messages,
+    }, null, 2);
+}
+
+function exportPromptSnapshot(record) {
+    const rec = record || requestHistory[0];
+    if (!rec) {
+        toastr.warning('没有可导出的请求记录');
+        return;
+    }
+
+    const messages = (rec.messages || []).map((msg, i) => ({
+        index: i,
+        role: msg?.role ?? '',
+        name: msg?.name ?? '',
+        content: getMessageText(msg),
+        hash: hashString(serializeMessage(msg)),
+    }));
+    const payload = {
+        id: rec.id,
+        at: rec.at,
+        model: rec.model,
+        usage: rec.usage,
+        stats: rec.stats,
+        messageCount: messages.length,
+        messages,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dco-prompt-${rec.id || 'unknown'}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toastr.success(`已导出 ${messages.length} 条消息`);
+}
+
+async function fetchMergedMessages(messages) {
+    try {
+        const cloned = clonePromptMessages(messages);
+        const response = await fetch('/api/backends/chat-completions/process', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                messages: cloned,
+                type: 'semi_tools',
+                char_name: name2 || '',
+                user_name: name1 || '',
+                group_names: getGroupNames(),
+            }),
+        });
+        if (!response.ok) {
+            console.warn('[DCO] /process endpoint returned HTTP', response.status);
+            return null;
+        }
+        const data = await response.json();
+        return Array.isArray(data?.messages) ? data.messages : null;
+    } catch (error) {
+        console.warn('[DCO] fetchMergedMessages failed:', error);
+        return null;
+    }
+}
+
+async function refreshBackendBodyRecords() {
+    const response = await fetch('/api/backends/chat-completions/dco-debug-bodies', {
+        headers: getRequestHeaders(),
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    backendBodyRecords = Array.isArray(data?.records) ? data.records : [];
+    return backendBodyRecords;
+}
+
+async function clearBackendBodyRecords() {
+    const response = await fetch('/api/backends/chat-completions/dco-debug-clear', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    backendBodyRecords = [];
+}
+
+function getBackendBodyById(id) {
+    return backendBodyRecords.find(record => record.id === id) || null;
+}
+
+function getDefaultBackendBodyCompareIds() {
+    return {
+        leftId: backendBodyRecords[1]?.id || backendBodyRecords[0]?.id || '',
+        rightId: backendBodyRecords[0]?.id || '',
+    };
+}
+
+function getBackendBodyOptionRows(selectedId = '') {
+    return backendBodyRecords.map(record => {
+        const label = [
+            record.id,
+            record.at ? new Date(record.at).toLocaleTimeString() : '',
+            record.model || '未知模型',
+            record.stream ? '流式' : '非流式',
+            `${formatNumber(record.byteLength)} bytes`,
+            record.hash,
+        ].filter(Boolean).join(' / ');
+        return `<option value="${escapeHtml(record.id)}" ${record.id === selectedId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
+}
+
+function getBackendBodyRows() {
+    return backendBodyRecords.map(record => {
+        const diff = record.diffFromPrevious;
+        const messageDiff = record.messageDiffFromPrevious;
+        return `
+            <tr>
+                <td>${escapeHtml(record.id)}</td>
+                <td>${record.at ? escapeHtml(new Date(record.at).toLocaleTimeString()) : ''}</td>
+                <td>${escapeHtml(record.model || '')}</td>
+                <td>${record.stream ? '流式' : '非流式'}</td>
+                <td>${formatNumber(record.charLength)}</td>
+                <td>${formatNumber(record.byteLength)}</td>
+                <td>${escapeHtml(record.hash || '')}</td>
+                <td>${diff ? (diff.identical ? '完全一致' : `${formatNumber(diff.firstDiffChar)} 字符 / ${formatNumber(diff.firstDiffByte)} 字节`) : '本页首次'}</td>
+                <td>${messageDiff ? `#${escapeHtml(messageDiff.index)} ${escapeHtml(messageDiff.leftRole || '')}->${escapeHtml(messageDiff.rightRole || '')}` : '-'}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function findFirstByteDiff(left, right) {
+    const leftBytes = new TextEncoder().encode(left);
+    const rightBytes = new TextEncoder().encode(right);
+    const max = Math.min(leftBytes.length, rightBytes.length);
+
+    for (let index = 0; index < max; index++) {
+        if (leftBytes[index] !== rightBytes[index]) {
+            return index;
+        }
+    }
+
+    return leftBytes.length === rightBytes.length ? -1 : max;
+}
+
+function getJsonPathDiff(leftValue, rightValue, path = '$') {
+    if (Object.is(leftValue, rightValue)) {
+        return null;
+    }
+
+    const leftIsArray = Array.isArray(leftValue);
+    const rightIsArray = Array.isArray(rightValue);
+    if (leftIsArray || rightIsArray) {
+        if (!leftIsArray || !rightIsArray) return path;
+        const max = Math.max(leftValue.length, rightValue.length);
+        for (let index = 0; index < max; index++) {
+            if (!(index in leftValue) || !(index in rightValue)) return `${path}[${index}]`;
+            const child = getJsonPathDiff(leftValue[index], rightValue[index], `${path}[${index}]`);
+            if (child) return child;
+        }
+        return null;
+    }
+
+    const leftIsObject = leftValue && typeof leftValue === 'object';
+    const rightIsObject = rightValue && typeof rightValue === 'object';
+    if (leftIsObject || rightIsObject) {
+        if (!leftIsObject || !rightIsObject) return path;
+        const keys = Array.from(new Set([...Object.keys(leftValue), ...Object.keys(rightValue)]));
+        for (const key of keys) {
+            if (!(key in leftValue) || !(key in rightValue)) return `${path}.${key}`;
+            const child = getJsonPathDiff(leftValue[key], rightValue[key], `${path}.${key}`);
+            if (child) return child;
+        }
+        return null;
+    }
+
+    return path;
+}
+
+function getBodyContext(body, index, radius = 180) {
+    if (index < 0) {
+        return '';
+    }
+
+    const start = Math.max(0, index - radius);
+    const end = Math.min(body.length, index + radius);
+    return body.slice(start, end);
+}
+
+function getBackendBodyDiffReport(leftId = '', rightId = '') {
+    const left = getBackendBodyById(leftId) || backendBodyRecords[1] || null;
+    const right = getBackendBodyById(rightId) || backendBodyRecords[0] || null;
+    if (!left || !right) {
+        return '至少需要两条后端最终请求体记录才能对比。修改后端代码后需要重启 SillyTavern，随后生成两次。';
+    }
+
+    const leftBody = String(left.body || '');
+    const rightBody = String(right.body || '');
+    const firstDiffChar = getCommonPrefixLength(leftBody, rightBody);
+    const identical = firstDiffChar === leftBody.length && leftBody.length === rightBody.length;
+    const firstDiffByte = identical ? -1 : findFirstByteDiff(leftBody, rightBody);
+    let leftJson = {};
+    let rightJson = {};
+    try {
+        leftJson = JSON.parse(leftBody || '{}');
+        rightJson = JSON.parse(rightBody || '{}');
+    } catch {
+        leftJson = {};
+        rightJson = {};
+    }
+    const jsonPath = getJsonPathDiff(leftJson, rightJson) || '无';
+    const leftMessageCount = Array.isArray(leftJson.messages) ? leftJson.messages.length : 0;
+    const rightMessageCount = Array.isArray(rightJson.messages) ? rightJson.messages.length : 0;
+    const messageDiff = getFirstBodyMessageDiff(leftJson, rightJson);
+
+    const lines = [
+        `对比最终 HTTP body：${left.id} -> ${right.id}`,
+        `时间：${left.at ? new Date(left.at).toLocaleString() : ''} -> ${right.at ? new Date(right.at).toLocaleString() : ''}`,
+        `模型：${left.model || '未知'} -> ${right.model || '未知'}；模式：${left.stream ? '流式' : '非流式'} -> ${right.stream ? '流式' : '非流式'}`,
+        `body 长度：${formatNumber(left.charLength)} 字符 / ${formatNumber(left.byteLength)} 字节 -> ${formatNumber(right.charLength)} 字符 / ${formatNumber(right.byteLength)} 字节`,
+        `body hash：${left.hash || ''} -> ${right.hash || ''}`,
+        `messages 数：${leftMessageCount} -> ${rightMessageCount}`,
+        identical ? '结论：两个最终 HTTP body 完全一致。' : `第一处不同：第 ${formatNumber(firstDiffChar)} 个 UTF-16 字符，第 ${formatNumber(firstDiffByte)} 个 UTF-8 字节。`,
+        `第一处 JSON 路径：${jsonPath}`,
+    ];
+
+    if (messageDiff) {
+        lines.push(
+            '',
+            `第一条不同 message：#${messageDiff.index}`,
+            `旧：${messageDiff.leftRole || '<无>'} len=${formatNumber(messageDiff.leftLength)} ${messageDiff.leftPreview}`,
+            `新：${messageDiff.rightRole || '<无>'} len=${formatNumber(messageDiff.rightLength)} ${messageDiff.rightPreview}`,
+        );
+    }
+
+    if (!identical) {
+        lines.push(
+            '',
+            '旧 body 首差异附近：',
+            getBodyContext(leftBody, firstDiffChar),
+            '',
+            '新 body 首差异附近：',
+            getBodyContext(rightBody, firstDiffChar),
+        );
+    }
+
+    return lines.join('\n');
+}
+
+function getFirstBodyMessageDiff(leftJson, rightJson) {
+    const leftMessages = Array.isArray(leftJson?.messages) ? leftJson.messages : [];
+    const rightMessages = Array.isArray(rightJson?.messages) ? rightJson.messages : [];
+    const max = Math.max(leftMessages.length, rightMessages.length);
+
+    for (let index = 0; index < max; index++) {
+        const leftMessage = leftMessages[index];
+        const rightMessage = rightMessages[index];
+        const leftText = JSON.stringify(leftMessage ?? null);
+        const rightText = JSON.stringify(rightMessage ?? null);
+        if (leftText !== rightText) {
+            const leftContent = typeof leftMessage?.content === 'string' ? leftMessage.content : leftText;
+            const rightContent = typeof rightMessage?.content === 'string' ? rightMessage.content : rightText;
+            return {
+                index,
+                leftRole: leftMessage?.role ?? '',
+                rightRole: rightMessage?.role ?? '',
+                leftLength: leftContent.length,
+                rightLength: rightContent.length,
+                leftPreview: normalizeText(leftContent).slice(0, 120),
+                rightPreview: normalizeText(rightContent).slice(0, 120),
+            };
+        }
+    }
+
+    return null;
+}
+
+function getBackendBodyJson(record = backendBodyRecords[0]) {
+    if (!record) {
+        return '';
+    }
+
+    try {
+        return JSON.stringify(JSON.parse(record.body || '{}'), null, 2);
+    } catch {
+        return String(record.body || '');
+    }
+}
+
+async function copyTextToClipboard(text, successMessage = '已复制') {
+    if (!text) {
+        toastr.warning('没有可复制的内容。');
+        return;
+    }
+
+    try {
+        await navigator.clipboard.writeText(text);
+        toastr.success(successMessage);
+    } catch (error) {
+        console.warn('[DeepSeek Cache Optimizer] Clipboard failed', error);
+        toastr.error('复制失败，请打开浏览器控制台手动复制。');
+    }
+}
+
 function getUsageSummaryText(record = lastBackendUsage) {
     if (!record?.usage) {
         return getBackendUsageText();
@@ -1308,10 +1943,10 @@ function getCacheDiagnosisText(stats = lastStats, usage = lastBackendUsage?.usag
     const metrics = getUsageMetrics(usage);
     const notes = [];
 
-    if (metrics.cachedTokens <= 0 && Number(stats.prefixPercent || 0) >= 70) {
-        notes.push('本地共同前缀较高但后端没有命中：这通常说明本地比较口径不是后端缓存键，或上游没有复用同一缓存会话。');
-    } else if (metrics.hitPercent < 20 && Number(stats.prefixPercent || 0) >= 70) {
-        notes.push('本地共同前缀较高但后端命中偏低：后端可能按 token 边界、模型参数、网关路由或缓存 TTL 判断，而不是按前端字符前缀判断。');
+    if (metrics.cachedTokens <= 0 && Number(stats.rawPrefixPercent || 0) >= 70) {
+        notes.push('本地原始前缀较高但后端没有命中：说明本地字符级比较和后端 token 缓存口径不同，或上游没有复用同一缓存会话。');
+    } else if (metrics.hitPercent < 20 && Number(stats.rawPrefixPercent || 0) >= 70) {
+        notes.push('本地原始前缀较高但后端命中偏低：后端可能按 token 边界、模型参数、网关路由或缓存 TTL 判断，而不是按前端字符前缀判断。');
     }
 
     if (Number(stats.stableMessagePrefixChars || 0) > 0 && metrics.cachedTokens > 0) {
@@ -1331,7 +1966,7 @@ function getCacheDiagnosisText(stats = lastStats, usage = lastBackendUsage?.usag
         notes.push('当前为流式请求，但没有看到 stream_options.include_usage；部分网关可能不会稳定返回最终 usage。');
     }
 
-    if (lastRecallResults.length > 0 && Number(stats.memoryImpact || 0) > 3) {
+    if (lastRecallResults.length > 0 && Number(stats.pluginImpact || 0) > 3) {
         notes.push('记忆召回正在改变请求前缀；可降低召回条数、提高重要度阈值，或减少最近事件常驻数量。');
     }
 
@@ -1360,12 +1995,11 @@ function handleBackendUsage(eventData) {
         requestSettingsSignature: getRequestSettingsSignature(lastGenerationSettings),
         requestType: lastGenerationSettings?.type || eventData.type || '',
     };
-    usageHistory.unshift({
-        ...lastBackendUsage,
-        stats: structuredClone(lastStats),
-        settingsSignature: getRequestSettingsSignature(lastGenerationSettings),
-    });
-    usageHistory = usageHistory.slice(0, 20);
+    const record = updateLatestRequestWithUsage(eventData);
+    if (record) {
+        record.stats = structuredClone(lastStats);
+    }
+    usageHistory = requestHistory.filter(item => item.usageReceived).slice(0, 20);
 
     updateStats();
 }
@@ -1416,6 +2050,24 @@ function isVariableSchemaMessage(message) {
     const hasVariableApi = /UpdateVariable|_.set\(|getvar\(|stat_data\.|path_of_changed_variable/i.test(text);
     const hasCurrentValues = /<status_current_variables>|当前所想|内心想法|当前位置|当前事件标记/i.test(text);
     return hasVariableApi && !hasCurrentValues;
+}
+
+function isWorldStaticMessageText(text) {
+    return /world info|lore|相关信息|世界书|data bank|relevant information|related information/i.test(text);
+}
+
+function isStablePromptLikeMessage(message) {
+    const text = getMessageText(message);
+    const normalized = normalizeText(text);
+    if (!normalized || isRichFormatMessage(message)) {
+        return false;
+    }
+
+    return isVariableSchemaMessage(message)
+        || isHistoryMarkerMessage(message)
+        || hasPattern(stableInstructionPatterns, normalized)
+        || hasPattern(stableContentPatterns, normalized)
+        || isWorldStaticMessageText(normalized);
 }
 
 function classifyPromptMessage(message, index, messages) {
@@ -1530,6 +2182,52 @@ function classifyPromptMessage(message, index, messages) {
         };
     }
 
+    if (hasPattern(stableInstructionPatterns, normalized)) {
+        const category = /输出|format|模板|段落|对白|字数|语言/i.test(normalized) ? 'format_rule' : 'stable_rule';
+        return {
+            index,
+            role,
+            category,
+            stability: 'stable',
+            movable: true,
+            order: category === 'format_rule' ? 320 : 100,
+            reason: '稳定预设/格式规则，适合前置形成缓存前缀',
+            length: text.length,
+            hash: hashString(serializeMessage(message)),
+            preview: normalized.slice(0, 80),
+        };
+    }
+
+    if (hasPattern(stableContentPatterns, normalized)) {
+        return {
+            index,
+            role,
+            category: 'character_static',
+            stability: 'stable',
+            movable: true,
+            order: 180,
+            reason: '角色卡/人物设定通常稳定，适合前置',
+            length: text.length,
+            hash: hashString(serializeMessage(message)),
+            preview: normalized.slice(0, 80),
+        };
+    }
+
+    if (isWorldStaticMessageText(normalized)) {
+        return {
+            index,
+            role,
+            category: 'world_static',
+            stability: 'medium',
+            movable: true,
+            order: 420,
+            reason: '世界书内容本身稳定但激活集合会变，放在核心静态设定之后',
+            length: text.length,
+            hash: hashString(serializeMessage(message)),
+            preview: normalized.slice(0, 80),
+        };
+    }
+
     if (role === 'user' && index === lastUserIndex) {
         return {
             index,
@@ -1591,7 +2289,7 @@ function classifyPromptMessage(message, index, messages) {
         };
     }
 
-    if (/world info|lore|相关信息|世界书|data bank|relevant information|related information/i.test(normalized)) {
+    if (isWorldStaticMessageText(normalized)) {
         return {
             index,
             role,
@@ -1694,44 +2392,36 @@ function shouldAnalyzerMove(item, settings) {
     return ['stable_rule', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'dynamic_state', 'memory_recall', 'history_marker', 'unknown_stable', 'empty'].includes(item.category);
 }
 
+function shouldPromoteAcrossHistory(item, settings) {
+    if (!shouldAnalyzerMove(item, settings)) {
+        return false;
+    }
+
+    return ['stable_rule', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'unknown_stable'].includes(item.category);
+}
+
 function reorderWithAnalyzer(messages, settings) {
     const analysis = messages.map((message, index) => classifyPromptMessage(message, index, messages));
-    const boundary = getAnalyzerBoundary(analysis);
-    const prefix = messages.slice(0, boundary);
-    const suffix = messages.slice(boundary);
-    const prefixAnalysis = analysis.slice(0, boundary);
-    const movable = [];
-    const fixed = [];
-
-    prefixAnalysis.forEach(item => {
-        if (shouldAnalyzerMove(item, settings)) {
-            movable.push(item);
-        } else {
-            fixed.push(item);
-        }
-    });
-
-    if (movable.length < Number(settings.minPrefixMessages || defaultSettings.minPrefixMessages)) {
+    const promotable = analysis.filter(item => shouldPromoteAcrossHistory(item, settings));
+    if (promotable.length < Number(settings.minPrefixMessages || defaultSettings.minPrefixMessages)) {
         return { changed: false, messages, moved: 0, protected: analysis.filter(item => item.category === 'rich_format').length, analysis };
     }
 
-    const orderedMovable = movable
+    const promotedIndexes = new Set(promotable.map(item => item.index));
+    const orderedPromoted = promotable
         .slice()
         .sort((a, b) => a.order - b.order || a.index - b.index)
+        .map(item => messages[item.index]);
+    const remaining = analysis
+        .filter(item => !promotedIndexes.has(item.index))
         .map(item => ({ item, message: messages[item.index] }));
-    const nextPrefix = [];
-    let movableCursor = 0;
-
-    for (let index = 0; index < prefix.length; index++) {
-        const fixedItem = fixed.find(item => item.index === index);
-        if (fixedItem) {
-            nextPrefix.push(messages[fixedItem.index]);
-        } else {
-            nextPrefix.push(orderedMovable[movableCursor++].message);
-        }
-    }
-
-    const reordered = [...nextPrefix, ...suffix];
+    const insertAt = remaining.findIndex(({ item }) => item.category === 'chat_history' || item.category === 'latest_input');
+    const insertionIndex = insertAt === -1 ? remaining.length : insertAt;
+    const reordered = [
+        ...remaining.slice(0, insertionIndex).map(entry => entry.message),
+        ...orderedPromoted,
+        ...remaining.slice(insertionIndex).map(entry => entry.message),
+    ];
     const changed = reordered.some((message, index) => message !== messages[index]);
     const nextAnalysis = reordered.map((message, index) => {
         const original = analysis.find(item => messages[item.index] === message);
@@ -1755,23 +2445,25 @@ function reorderWithAnalyzer(messages, settings) {
 async function optimizeChatCompletionPrompt(eventData) {
     const settings = getSettings();
 
-    if (!settings.enabled) {
-        lastStats = { moved: 0, total: 0, skipped: '已禁用', protected: 0, prefixChars: 0, prefixPercent: 0, firstChangedMessage: null, firstMessageHash: '' };
-        updateStats();
+    if (eventData?.dryRun) {
         return;
     }
 
     if (!Array.isArray(eventData?.chat)) {
-        lastStats = { moved: 0, total: 0, skipped: '没有聊天请求数据', protected: 0, prefixChars: 0, prefixPercent: 0, firstChangedMessage: null, firstMessageHash: '' };
+        lastStats = { moved: 0, total: 0, skipped: '没有聊天请求数据', protected: 0, rawPrefixChars: 0, rawPrefixPercent: 0, rawInputPercent: 0, pluginImpact: 0, firstChangedMessage: null, firstMessageHash: '' };
         updateStats();
         return;
     }
 
-    // Serialize history-only (before memory injection) for comparison
-    const historyOnlySerialized = eventData.chat.map(serializeMessage).join('\n');
+    // Serialize raw content (before plugin modifications) for prefix comparison
+    const rawContentBefore = serializeRawContent(eventData.chat);
 
     promptRunCounter += 1;
-    const memoryInjection = buildStructuredInjection(await recallStructuredMemory(eventData.chat));
+
+    // Memory injection: always runs if enabled
+    const memoryInjection = settings.memoryEnabled !== false
+        ? buildStructuredInjection(await recallStructuredMemory(eventData.chat))
+        : null;
     if (memoryInjection) {
         eventData.chat.push({
             role: 'system',
@@ -1780,36 +2472,77 @@ async function optimizeChatCompletionPrompt(eventData) {
         });
     }
 
-    const result = reorderWithAnalyzer(eventData.chat, settings);
-    if (result.changed) {
-        eventData.chat.splice(0, eventData.chat.length, ...result.messages);
+    // Reordering: only runs if explicitly enabled
+    let totalMoved = 0;
+    let totalProtected = 0;
+    if (false && settings.enabled) {
+        const result = reorderWithAnalyzer(eventData.chat, settings);
+        if (result.changed) {
+            eventData.chat.splice(0, eventData.chat.length, ...result.messages);
+        }
+        totalMoved = result.moved;
+        totalProtected = result.protected;
+        lastPromptAnalysis = result.analysis || eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
+    } else {
+        lastPromptAnalysis = eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
     }
-    const totalMoved = result.moved;
-    const totalProtected = result.protected;
-    lastPromptAnalysis = result.analysis || eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
+
+    // --- Merge-aware stability (calls server /process endpoint) ---
+    let mergedMessages = null;
+    let mergedContentAfter = '';
+    let mergedPrefixPercent = null;
+    let mergedPrefixChars = null;
+    let mergedSignatures = [];
+    let mergedMessagePrefixCount = null;
+    let mergedFirstChangedMessage = null;
+
+    if (mergeAwareAvailable) {
+        mergedMessages = await fetchMergedMessages(eventData.chat);
+        if (mergedMessages) {
+            mergedContentAfter = serializeMessagesAsJson(mergedMessages);
+            mergedSignatures = getMessageSignatures(mergedMessages);
+            const len = previousMergedContent
+                ? getCommonPrefixLength(previousMergedContent, mergedContentAfter)
+                : 0;
+            mergedPrefixChars = len;
+            mergedPrefixPercent = previousMergedContent
+                ? Math.round((len / Math.max(mergedContentAfter.length, 1)) * 10000) / 100
+                : 0;
+            mergedFirstChangedMessage = previousMergedSignatures.length
+                ? getFirstChangedMessage(mergedSignatures, previousMergedSignatures)
+                : null;
+            mergedMessagePrefixCount = Number.isInteger(mergedFirstChangedMessage)
+                ? mergedFirstChangedMessage
+                : mergedSignatures.length;
+        } else {
+            mergeAwareAvailable = false;
+            console.warn('[DCO] /process endpoint unavailable, falling back to raw stability only');
+        }
+    }
 
     const serializedPrompt = eventData.chat.map(serializeMessage).join('\n');
+    const rawContentAfter = serializeRawContent(eventData.chat);
     const messageSignatures = getMessageSignatures(eventData.chat);
 
-    // Total prefix (with memory injection)
-    const prefixChars = previousSerializedPrompt
-        ? getCommonPrefixLength(previousSerializedPrompt, serializedPrompt)
+    // Raw input prefix: ST natural stability (current raw vs previous raw)
+    const rawInputChars = previousRawInput
+        ? getCommonPrefixLength(previousRawInput, rawContentBefore)
         : 0;
-    const prefixPercent = previousSerializedPrompt
-        ? Math.round((prefixChars / Math.max(serializedPrompt.length, 1)) * 10000) / 100
-        : 0;
-
-    // History-only prefix (without memory injection)
-    const historyPrefixChars = previousHistoryOnlySerialized
-        ? getCommonPrefixLength(previousHistoryOnlySerialized, historyOnlySerialized)
-        : 0;
-    const historyPrefixPercent = previousHistoryOnlySerialized
-        ? Math.round((historyPrefixChars / Math.max(historyOnlySerialized.length, 1)) * 10000) / 100
+    const rawInputPercent = previousRawInput
+        ? Math.round((rawInputChars / Math.max(rawContentBefore.length, 1)) * 10000) / 100
         : 0;
 
-    // Memory impact: positive means memory breaks cache, negative means memory helps
-    const memoryImpact = previousHistoryOnlySerialized && previousSerializedPrompt
-        ? Math.round((historyPrefixPercent - prefixPercent) * 100) / 100
+    // Final prefix: actual cache metric (current final vs previous final)
+    const rawPrefixChars = previousRawContent
+        ? getCommonPrefixLength(previousRawContent, rawContentAfter)
+        : 0;
+    const rawPrefixPercent = previousRawContent
+        ? Math.round((rawPrefixChars / Math.max(rawContentAfter.length, 1)) * 10000) / 100
+        : 0;
+
+    // Plugin impact: how much the plugin breaks the prefix
+    const pluginImpact = previousRawContent
+        ? Math.round((rawInputPercent - rawPrefixPercent) * 100) / 100
         : 0;
 
     const firstChangedMessage = previousMessageSignatures.length
@@ -1823,13 +2556,12 @@ async function optimizeChatCompletionPrompt(eventData) {
     lastStats = {
         moved: totalMoved,
         total: eventData.chat.length,
-        skipped: result.changed ? '' : '无需重排',
+        skipped: settings.enabled ? (totalMoved > 0 ? `${totalMoved} 条已重排` : '无需重排') : '重排已关闭',
         protected: totalProtected,
-        prefixChars,
-        prefixPercent,
-        historyPrefixChars,
-        historyPrefixPercent,
-        memoryImpact,
+        rawPrefixChars,
+        rawPrefixPercent,
+        rawInputPercent,
+        pluginImpact,
         firstChangedMessage,
         stableMessagePrefixCount,
         stableMessagePrefixChars,
@@ -1841,11 +2573,33 @@ async function optimizeChatCompletionPrompt(eventData) {
         runId: promptRunCounter,
         requestSettingsSignature: '',
         requestType: '',
+        mergedPrefixChars,
+        mergedPrefixPercent,
+        mergedMessagePrefixCount,
+        mergedFirstChangedMessage,
+        mergedTotalMessages: mergedMessages?.length ?? null,
     };
 
     previousSerializedPrompt = serializedPrompt;
-    previousHistoryOnlySerialized = historyOnlySerialized;
+    previousRawContent = rawContentAfter;
+    previousRawInput = rawContentBefore;
     previousMessageSignatures = messageSignatures;
+    try {
+        localStorage.setItem('dco_prevRawContent', rawContentAfter);
+        localStorage.setItem('dco_prevRawInput', rawContentBefore);
+    } catch { /* quota exceeded */ }
+    if (mergedMessages) {
+        previousMergedContent = mergedContentAfter;
+        previousMergedSignatures = mergedSignatures;
+        try { localStorage.setItem('dco_prevMergedContent', mergedContentAfter); } catch {}
+    }
+    rememberRequestRecord(makeRequestRecord({
+        messages: eventData.chat,
+        stats: lastStats,
+        analysis: lastPromptAnalysis,
+        serializedPrompt,
+        mergedMessages,
+    }));
     if (settings.debug) {
         console.debug('[DeepSeek Cache Optimizer]', lastStats, eventData.chat);
     }
@@ -1878,11 +2632,13 @@ function updateStats() {
         : '';
 
     diagnostics.text([
-        `总前缀（含记忆）：${lastStats.prefixChars || 0} 字符（${lastStats.prefixPercent || 0}%）`,
-        `历史前缀（无记忆）：${lastStats.historyPrefixChars || 0} 字符（${lastStats.historyPrefixPercent || 0}%）`,
-        `记忆破坏量：${lastStats.memoryImpact || 0}%`,
+        `最终前缀：${lastStats.rawPrefixChars || 0} 字符（${lastStats.rawPrefixPercent || 0}%）`,
+        `ST自然前缀：${lastStats.rawInputPercent || 0}%`,
+        `插件影响量：${lastStats.pluginImpact || 0}%`,
         `第一条发生变化的消息：${firstChanged}`,
         `稳定消息前缀：${lastStats.stableMessagePrefixCount ?? 0} 条，约 ${lastStats.stableMessagePrefixChars ?? 0} 文本字符`,
+        `合并后前缀：${lastStats.mergedPrefixChars ?? 'N/A'} 字符（${lastStats.mergedPrefixPercent ?? 'N/A'}%）`,
+        `合并后稳定消息：${lastStats.mergedMessagePrefixCount ?? 'N/A'} / ${lastStats.mergedTotalMessages ?? 'N/A'} 条`,
         `第一条消息：长度=${lastStats.firstMessageLength || 0}，hash=${lastStats.firstMessageHash || 'n/a'}`,
         `动态块后移：${lastStats.dynamicMoved || 0} 条`,
         `本地记忆：本轮召回 ${lastRecallResults.length} 条`,
@@ -1913,6 +2669,15 @@ function updateStats() {
     }
     $('#dco_update_extension').prop('disabled', updateRunning);
     $('#dco_check_update').prop('disabled', updateRunning);
+
+    // Update sidebar quick stats
+    const sidebarStats = $('#dco_sidebar_stats');
+    if (sidebarStats.length) {
+        const usage = getBackendUsageMetrics();
+        sidebarStats.find('.dco-sidebar-stat:eq(0) b').text(`${usage.hitPercent || 0}%`);
+        sidebarStats.find('.dco-sidebar-stat:eq(1) b').text(`${lastStats.rawPrefixPercent || 0}%`);
+        sidebarStats.find('.dco-sidebar-stat:eq(2) b').text(memoryExtractorStatus.length > 12 ? memoryExtractorStatus.slice(0, 12) + '...' : memoryExtractorStatus);
+    }
 }
 
 function getTokenEstimateText() {
@@ -1930,22 +2695,21 @@ function getTokenEstimateText() {
 }
 
 function getHistoryRows() {
-    return usageHistory.map((record, index) => {
+    return requestHistory.map((record, index) => {
         const metrics = getUsageMetrics(record.usage);
         const stats = record.stats || {};
         return `
             <tr>
-                <td>#${usageHistory.length - index}</td>
+                <td>${escapeHtml(record.id || `#${requestHistory.length - index}`)}</td>
                 <td>${escapeHtml(record.at?.toLocaleTimeString?.() || '')}</td>
                 <td>${escapeHtml(record.model || '')}</td>
                 <td>${record.stream ? '流式' : '非流式'}</td>
                 <td>${formatNumber(metrics.promptTokens)}</td>
                 <td>${formatNumber(metrics.cachedTokens)}</td>
                 <td>${formatNumber(metrics.missTokens)}</td>
-                <td>${metrics.hitPercent}%</td>
-                <td>${stats.prefixPercent ?? 0}%</td>
-                <td>${stats.historyPrefixPercent ?? 0}%</td>
-                <td>${stats.memoryImpact ?? 0}%</td>
+                <td>${record.usageReceived ? `${metrics.hitPercent}%` : '未收到 usage'}</td>
+                <td>${stats.rawPrefixPercent ?? 0}%</td>
+                <td>${stats.pluginImpact ?? 0}%</td>
                 <td>${stats.runId && stats.runId <= 1 ? '本页首次' : (stats.firstChangedMessage ?? '无')}</td>
             </tr>
         `;
@@ -2142,6 +2906,20 @@ async function openPanel(activeTab = 'optimizer') {
     const analysisRows = getAnalysisRows();
     const historyRows = getHistoryRows();
     const rawUsage = lastBackendUsage?.usage ? JSON.stringify(lastBackendUsage.usage, null, 2) : '';
+    const defaultCompare = getDefaultCompareIds();
+    const compareReport = getMessageDiffReport(defaultCompare.leftId, defaultCompare.rightId);
+    const requestOptionsLeft = getRequestOptionRows(defaultCompare.leftId);
+    const requestOptionsRight = getRequestOptionRows(defaultCompare.rightId);
+    try {
+        await refreshBackendBodyRecords();
+    } catch (error) {
+        console.warn('[DeepSeek Cache Optimizer] Failed to refresh backend body records', error);
+    }
+    const defaultBodyCompare = getDefaultBackendBodyCompareIds();
+    const bodyCompareReport = getBackendBodyDiffReport(defaultBodyCompare.leftId, defaultBodyCompare.rightId);
+    const bodyOptionsLeft = getBackendBodyOptionRows(defaultBodyCompare.leftId);
+    const bodyOptionsRight = getBackendBodyOptionRows(defaultBodyCompare.rightId);
+    const backendBodyRows = getBackendBodyRows();
     const extractorModels = await fetchExtractorModels(settings);
     const currentModel = String(settings.memoryLlmModel || '').trim();
     const useManualMode = currentModel && !extractorModels.includes(currentModel);
@@ -2151,7 +2929,7 @@ async function openPanel(activeTab = 'optimizer') {
         <div class="dco-panel">
             <div class="dco-panel-header">
                 <h2>DeepSeek Cache Optimizer</h2>
-                <span class="dco-version">v0.6.2</span>
+                <span class="dco-version">v0.6.4-local-a</span>
                 <button id="dco_panel_refresh" class="menu_button" style="margin-left:auto;">刷新</button>
             </div>
             <nav class="dco-tabs">
@@ -2166,37 +2944,42 @@ async function openPanel(activeTab = 'optimizer') {
                             <div class="dco-card-title">规则区</div>
                             <label class="checkbox_label dco-inline" for="dco_modal_enabled">
                                 <input id="dco_modal_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''} />
-                                <span>启用请求级 Prompt 重排</span>
+                                <span>启用 Prompt 消息重排（关闭后仅保留记忆注入）</span>
                             </label>
-                            <label class="checkbox_label dco-inline" for="dco_modal_protect">
-                                <input id="dco_modal_protect" type="checkbox" ${settings.protectRichFormat ? 'checked' : ''} />
-                                <span>保护 HTML/CSS 富格式块</span>
-                            </label>
-                            <label>
-                                <span>策略</span>
-                                <select id="dco_modal_strategy" class="text_pole">
-                                    <option value="conservative" ${settings.strategy === 'conservative' ? 'selected' : ''}>保守</option>
-                                    <option value="balanced" ${settings.strategy === 'balanced' ? 'selected' : ''}>均衡</option>
-                                    <option value="aggressive" ${settings.strategy === 'aggressive' ? 'selected' : ''}>激进</option>
-                                </select>
-                            </label>
-                            <div class="dco-rule-flow">
-                                <div><span class="dco-dot blue"></span>稳定设定</div><b>→</b><div>尽量前置</div>
-                                <div><span class="dco-dot green"></span>普通规则</div><b>→</b><div>保持顺序</div>
-                                <div><span class="dco-dot amber"></span>动态状态</div><b>→</b><div>尽量后置</div>
-                                <div><span class="dco-dot gray"></span>富格式块</div><b>→</b><div>原位保护</div>
+                            <div id="dco_reorder_options" ${settings.enabled ? '' : 'style="display:none"'}>
+                                <label class="checkbox_label dco-inline" for="dco_modal_protect">
+                                    <input id="dco_modal_protect" type="checkbox" ${settings.protectRichFormat ? 'checked' : ''} />
+                                    <span>保护 HTML/CSS 富格式块</span>
+                                </label>
+                                <label>
+                                    <span>策略</span>
+                                    <select id="dco_modal_strategy" class="text_pole">
+                                        <option value="conservative" ${settings.strategy === 'conservative' ? 'selected' : ''}>保守</option>
+                                        <option value="balanced" ${settings.strategy === 'balanced' ? 'selected' : ''}>均衡</option>
+                                        <option value="aggressive" ${settings.strategy === 'aggressive' ? 'selected' : ''}>激进</option>
+                                    </select>
+                                </label>
+                                <div class="dco-rule-flow">
+                                    <div><span class="dco-dot blue"></span>稳定设定</div><b>→</b><div>尽量前置</div>
+                                    <div><span class="dco-dot green"></span>普通规则</div><b>→</b><div>保持顺序</div>
+                                    <div><span class="dco-dot amber"></span>动态状态</div><b>→</b><div>尽量后置</div>
+                                    <div><span class="dco-dot gray"></span>富格式块</div><b>→</b><div>原位保护</div>
+                                </div>
                             </div>
+                            ${!settings.enabled ? '<div class="dco-muted" style="margin-top:0.5rem">重排已关闭。消息保持原始顺序，仅执行记忆注入。</div>' : ''}
                         </section>
                         <section class="dco-card">
                             <div class="dco-card-title">请求概览</div>
                             <div class="dco-metric-grid">
                                 <div class="dco-metric"><span>消息数</span><b>${stats.total || 0}</b></div>
-                                <div class="dco-metric"><span>移动</span><b>${stats.moved || 0}</b></div>
-                                <div class="dco-metric warn"><span>动态后移</span><b>${stats.dynamicMoved || 0}</b></div>
-                                <div class="dco-metric"><span>保护</span><b>${stats.protected || 0}</b></div>
-                                <div class="dco-metric"><span>共同前缀</span><b>${stats.prefixPercent || 0}%</b></div>
-                                <div class="dco-metric success"><span>历史前缀</span><b>${stats.historyPrefixPercent || 0}%</b></div>
-                                <div class="dco-metric${stats.memoryImpact > 5 ? ' warn' : ''}"><span>记忆破坏</span><b>${stats.memoryImpact || 0}%</b></div>
+                                ${settings.enabled ? `
+                                    <div class="dco-metric"><span>移动</span><b>${stats.moved || 0}</b></div>
+                                    <div class="dco-metric warn"><span>动态后移</span><b>${stats.dynamicMoved || 0}</b></div>
+                                    <div class="dco-metric"><span>保护</span><b>${stats.protected || 0}</b></div>
+                                ` : ''}
+                                <div class="dco-metric"><span>最终前缀</span><b>${stats.rawPrefixPercent || 0}%</b></div>
+                                <div class="dco-metric success"><span>ST自然前缀</span><b>${stats.rawInputPercent || 0}%</b></div>
+                                <div class="dco-metric${stats.pluginImpact > 3 ? ' warn' : ' success'}"><span>插件影响</span><b>${stats.pluginImpact || 0}%</b></div>
                             </div>
                             <pre class="dco-diagnostics dco-modal-diagnostics">${$('#dco_diagnostics').text() || '暂无请求记录。'}</pre>
                             <div class="dco-card-title">后端真实 usage</div>
@@ -2217,24 +3000,25 @@ async function openPanel(activeTab = 'optimizer') {
                     </div>
                 </section>
                 <section class="dco-pane${activeTab === 'compare' ? ' dco-pane--active' : ''}" data-pane="compare">
+                    <div class="dco-card-title">前缀分析</div>
                     <div class="dco-metric-grid dco-wide-metrics">
-                        <div class="dco-metric warn"><span>总前缀（含记忆）</span><b>${stats.prefixPercent || 0}%</b></div>
-                        <div class="dco-metric success"><span>历史前缀（无记忆）</span><b>${stats.historyPrefixPercent || 0}%</b></div>
-                        <div class="dco-metric${stats.memoryImpact > 5 ? ' warn' : ' success'}"><span>记忆破坏量</span><b>${stats.memoryImpact || 0}%</b></div>
-                        <div class="dco-metric"><span>共同字符</span><b>${stats.prefixChars || 0}</b></div>
+                        <div class="dco-metric success"><span>最终前缀</span><b>${stats.rawPrefixPercent || 0}%</b></div>
+                        <div class="dco-metric success"><span>ST自然前缀</span><b>${stats.rawInputPercent || 0}%</b></div>
+                        <div class="dco-metric${stats.pluginImpact > 3 ? ' warn' : ' success'}"><span>插件影响量</span><b>${stats.pluginImpact || 0}%</b></div>
+                        <div class="dco-metric"><span>共同字符</span><b>${stats.rawPrefixChars || 0}</b></div>
                     </div>
                     <div class="dco-metric-grid dco-wide-metrics">
-                        <div class="dco-metric"><span>历史共同字符</span><b>${stats.historyPrefixChars || 0}</b></div>
                         <div class="dco-metric"><span>第一处变化</span><b>${stats.firstChangedMessage ?? '无'}</b></div>
                         <div class="dco-metric"><span>稳定消息数</span><b>${stats.stableMessagePrefixCount ?? 0}</b></div>
                         <div class="dco-metric"><span>稳定字符</span><b>${formatNumber(stats.stableMessagePrefixChars || 0)}</b></div>
                         <div class="dco-metric"><span>消息数</span><b>${stats.total || 0}</b></div>
                     </div>
+                    <div class="dco-card-title" style="margin-top:1rem">后端缓存</div>
                     <div class="dco-metric-grid dco-wide-metrics">
-                        <div class="dco-metric accent"><span>后端 Prompt tokens</span><b>${formatNumber(usageMetrics.promptTokens)}</b></div>
-                        <div class="dco-metric success"><span>后端缓存命中</span><b>${formatNumber(usageMetrics.cachedTokens)}</b></div>
-                        <div class="dco-metric warn"><span>后端未命中</span><b>${formatNumber(usageMetrics.missTokens)}</b></div>
-                        <div class="dco-metric"><span>后端命中率</span><b>${usageMetrics.hitPercent || 0}%</b></div>
+                        <div class="dco-metric accent"><span>Prompt tokens</span><b>${formatNumber(usageMetrics.promptTokens)}</b></div>
+                        <div class="dco-metric success"><span>缓存命中</span><b>${formatNumber(usageMetrics.cachedTokens)}</b></div>
+                        <div class="dco-metric warn"><span>未命中</span><b>${formatNumber(usageMetrics.missTokens)}</b></div>
+                        <div class="dco-metric"><span>命中率</span><b>${usageMetrics.hitPercent || 0}%</b></div>
                     </div>
                     <section class="dco-card">
                         <div class="dco-card-title">后端返回 usage</div>
@@ -2247,18 +3031,70 @@ async function openPanel(activeTab = 'optimizer') {
                         ` : ''}
                     </section>
                     <section class="dco-card">
-                        <div class="dco-card-title">最近请求历史</div>
+                        <div class="dco-card-title">每次请求记录</div>
                         <div class="dco-table-wrap dco-history-wrap">
                             <table class="dco-table">
                                 <thead>
                                     <tr>
                                         <th>轮次</th><th>时间</th><th>模型</th><th>模式</th><th>Prompt</th>
-                                        <th>命中</th><th>未命中</th><th>后端命中率</th><th>总前缀</th><th>历史前缀</th><th>记忆破坏</th><th>首变</th>
+                                        <th>命中</th><th>未命中</th><th>后端命中率</th><th>最终前缀</th><th>插件影响</th><th>首变</th>
                                     </tr>
                                 </thead>
-                                <tbody>${historyRows || '<tr><td colspan="12">暂无历史。生成一次并收到后端 usage 后会记录在这里。</td></tr>'}</tbody>
+                                <tbody>${historyRows || '<tr><td colspan="12">暂无请求。生成一次后会立刻记录；即使流式 usage 没返回也会保留。</td></tr>'}</tbody>
                             </table>
                         </div>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">请求差异对比</div>
+                        <div class="dco-settings-grid">
+                            <label>
+                                <span>旧请求</span>
+                                <select id="dco_compare_left" class="text_pole">${requestOptionsLeft || '<option value="">暂无请求</option>'}</select>
+                            </label>
+                            <label>
+                                <span>新请求</span>
+                                <select id="dco_compare_right" class="text_pole">${requestOptionsRight || '<option value="">暂无请求</option>'}</select>
+                            </label>
+                        </div>
+                        <div class="dco-action-row">
+                            <button id="dco_copy_diff" class="menu_button">复制差异报告</button>
+                            <button id="dco_copy_left_request" class="menu_button">复制旧请求 JSON</button>
+                            <button id="dco_copy_right_request" class="menu_button">复制新请求 JSON</button>
+                        </div>
+                        <pre id="dco_compare_report" class="dco-diagnostics dco-modal-diagnostics">${escapeHtml(compareReport)}</pre>
+                    </section>
+                    <section class="dco-card">
+                        <div class="dco-card-title">后端最终 HTTP body</div>
+                        <div class="dco-action-row">
+                            <button id="dco_backend_body_refresh" class="menu_button">刷新后端最终请求体</button>
+                            <button id="dco_backend_body_clear" class="menu_button danger_button">清空后端记录</button>
+                        </div>
+                        <div class="dco-table-wrap dco-history-wrap">
+                            <table class="dco-table">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th><th>时间</th><th>模型</th><th>模式</th><th>字符</th><th>字节</th><th>Hash</th><th>相对上一条首差异</th><th>首变消息</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${backendBodyRows || '<tr><td colspan="9">暂无后端最终 body。后端代码改动后需要重启 SillyTavern，再生成一次。</td></tr>'}</tbody>
+                            </table>
+                        </div>
+                        <div class="dco-settings-grid">
+                            <label>
+                                <span>旧 body</span>
+                                <select id="dco_body_compare_left" class="text_pole">${bodyOptionsLeft || '<option value="">暂无记录</option>'}</select>
+                            </label>
+                            <label>
+                                <span>新 body</span>
+                                <select id="dco_body_compare_right" class="text_pole">${bodyOptionsRight || '<option value="">暂无记录</option>'}</select>
+                            </label>
+                        </div>
+                        <div class="dco-action-row">
+                            <button id="dco_copy_body_diff" class="menu_button">复制 body 差异报告</button>
+                            <button id="dco_copy_left_body" class="menu_button">复制旧 body JSON</button>
+                            <button id="dco_copy_right_body" class="menu_button">复制新 body JSON</button>
+                        </div>
+                        <pre id="dco_body_compare_report" class="dco-diagnostics dco-modal-diagnostics">${escapeHtml(bodyCompareReport)}</pre>
                     </section>
                     <details class="dco-card dco-details-card">
                         <summary class="dco-card-title">为什么和 LLM 后台 token 对不上</summary>
@@ -2270,10 +3106,20 @@ async function openPanel(activeTab = 'optimizer') {
                     </details>
                 </section>
                 <section class="dco-pane${activeTab === 'memory' ? ' dco-pane--active' : ''}" data-pane="memory">
-                    <div class="dco-action-row">
-                        <button id="dco_memory_clear_all" class="menu_button danger_button">清空所有数据</button>
-                        <span class="dco-muted">世界书索引词 ${lastWorldInfoTerms.length} 个</span>
-                    </div>
+                    <section class="dco-card">
+                        <div class="dco-card-title">抽取状态</div>
+                        <div class="dco-metric-grid">
+                            <div class="dco-metric${memoryExtractorRunning ? ' accent' : ''}"><span>状态</span><b style="font-size:1rem">${escapeHtml(memoryExtractorStatus)}</b></div>
+                            <div class="dco-metric"><span>上次抽取</span><b style="font-size:1rem">${lastMemoryExtractorResult ? escapeHtml(lastMemoryExtractorResult.at.toLocaleTimeString()) : '暂无'}</b></div>
+                            <div class="dco-metric"><span>执行命令</span><b>${lastMemoryExtractorResult ? lastMemoryExtractorResult.executed : 0}</b></div>
+                            <div class="dco-metric"><span>抽取间隔</span><b>${settings.memoryLlmEveryTurns || 3} 轮</b></div>
+                        </div>
+                        <div class="dco-action-row">
+                            <button id="dco_memory_llm_run_top" class="menu_button"><i class="fa-solid fa-play"></i> 手动抽取</button>
+                            <button id="dco_memory_clear_all" class="menu_button danger_button">清空所有数据</button>
+                            <span class="dco-muted">世界书索引词 ${lastWorldInfoTerms.length} 个</span>
+                        </div>
+                    </section>
                     <section class="dco-card">
                         <div class="dco-card-title">开关</div>
                         <div class="dco-settings-grid">
@@ -2462,8 +3308,70 @@ async function openPanel(activeTab = 'optimizer') {
         openPanel(activeTab);
     });
 
+    const refreshCompareReport = () => {
+        const leftId = String(html.find('#dco_compare_left').val() || '');
+        const rightId = String(html.find('#dco_compare_right').val() || '');
+        html.find('#dco_compare_report').text(getMessageDiffReport(leftId, rightId));
+    };
+    html.find('#dco_compare_left, #dco_compare_right').on('change', refreshCompareReport);
+    html.find('#dco_copy_diff').on('click', async () => {
+        const leftId = String(html.find('#dco_compare_left').val() || '');
+        const rightId = String(html.find('#dco_compare_right').val() || '');
+        await copyTextToClipboard(getMessageDiffReport(leftId, rightId), '已复制差异报告');
+    });
+    html.find('#dco_copy_left_request').on('click', async () => {
+        const record = getRequestById(String(html.find('#dco_compare_left').val() || ''));
+        await copyTextToClipboard(getRequestJson(record), '已复制旧请求 JSON');
+    });
+    html.find('#dco_copy_right_request').on('click', async () => {
+        const record = getRequestById(String(html.find('#dco_compare_right').val() || ''));
+        await copyTextToClipboard(getRequestJson(record), '已复制新请求 JSON');
+    });
+    const refreshBodyCompareReport = () => {
+        const leftId = String(html.find('#dco_body_compare_left').val() || '');
+        const rightId = String(html.find('#dco_body_compare_right').val() || '');
+        html.find('#dco_body_compare_report').text(getBackendBodyDiffReport(leftId, rightId));
+    };
+    html.find('#dco_body_compare_left, #dco_body_compare_right').on('change', refreshBodyCompareReport);
+    html.find('#dco_backend_body_refresh').on('click', async () => {
+        try {
+            await refreshBackendBodyRecords();
+            openPanel('compare');
+        } catch (error) {
+            console.warn('[DeepSeek Cache Optimizer] Failed to refresh backend body records', error);
+            toastr.error('刷新后端最终请求体失败。若刚修改过后端，请先重启 SillyTavern。');
+        }
+    });
+    html.find('#dco_backend_body_clear').on('click', async () => {
+        try {
+            await clearBackendBodyRecords();
+            toastr.info('已清空后端最终请求体记录');
+            openPanel('compare');
+        } catch (error) {
+            console.warn('[DeepSeek Cache Optimizer] Failed to clear backend body records', error);
+            toastr.error('清空后端记录失败。');
+        }
+    });
+    html.find('#dco_copy_body_diff').on('click', async () => {
+        const leftId = String(html.find('#dco_body_compare_left').val() || '');
+        const rightId = String(html.find('#dco_body_compare_right').val() || '');
+        await copyTextToClipboard(getBackendBodyDiffReport(leftId, rightId), '已复制 body 差异报告');
+    });
+    html.find('#dco_copy_left_body').on('click', async () => {
+        const record = getBackendBodyById(String(html.find('#dco_body_compare_left').val() || ''));
+        await copyTextToClipboard(getBackendBodyJson(record), '已复制旧 body JSON');
+    });
+    html.find('#dco_copy_right_body').on('click', async () => {
+        const record = getBackendBodyById(String(html.find('#dco_body_compare_right').val() || ''));
+        await copyTextToClipboard(getBackendBodyJson(record), '已复制新 body JSON');
+    });
+
     // Optimizer tab bindings
-    html.find('#dco_modal_enabled').on('input', function () { settings.enabled = Boolean(this.checked); persist(); });
+    html.find('#dco_modal_enabled').on('input', function () {
+        settings.enabled = Boolean(this.checked);
+        html.find('#dco_reorder_options').toggle(settings.enabled);
+        persist();
+    });
     html.find('#dco_modal_protect').on('input', function () { settings.protectRichFormat = Boolean(this.checked); persist(); });
     html.find('#dco_modal_strategy').on('change', function () { settings.strategy = String(this.value || defaultSettings.strategy); persist(); });
 
@@ -2514,6 +3422,13 @@ async function openPanel(activeTab = 'optimizer') {
         settings.memoryLlmEnabled = true;
         saveSettingsDebounced();
         await runMemoryLlmExtraction({ manual: true });
+    });
+    html.find('#dco_memory_llm_run_top').on('click', async () => {
+        settings.memoryEnabled = true;
+        settings.memoryLlmEnabled = true;
+        saveSettingsDebounced();
+        await runMemoryLlmExtraction({ manual: true });
+        openPanel('memory');
     });
     html.find('#dco_memory_clear_all').on('click', async () => {
         await clearAllTables();
@@ -2586,14 +3501,16 @@ function bindSettings() {
     const settings = getSettings();
 
     $('#dco_enabled').prop('checked', settings.enabled);
-    $('#dco_strategy').val(settings.strategy);
-    $('#dco_protect_rich_format').prop('checked', settings.protectRichFormat);
+    $('#dco_strategy').val(settings.strategy).closest('label').toggle(settings.enabled);
+    $('#dco_protect_rich_format').prop('checked', settings.protectRichFormat).closest('label').toggle(settings.enabled);
     $('#dco_debug').prop('checked', settings.debug);
     $('#dco_memory_enabled').prop('checked', settings.memoryEnabled);
     $('#dco_memory_llm_enabled').prop('checked', settings.memoryLlmEnabled);
 
     $('#dco_enabled').on('input', function () {
         settings.enabled = Boolean(this.checked);
+        $('#dco_strategy').closest('label').toggle(settings.enabled);
+        $('#dco_protect_rich_format').closest('label').toggle(settings.enabled);
         saveSettingsDebounced();
     });
     $('#dco_strategy').on('change', function () {
@@ -2643,11 +3560,16 @@ function renderSettings() {
                     <button id="dco_update_extension" class="menu_button"><i class="fa-solid fa-download"></i> 更新扩展</button>
                 </div>
                 <div id="dco_update_status" class="dco-muted">${escapeHtml(getUpdateStatusText())}</div>
+                <div id="dco_sidebar_stats" class="dco-sidebar-stats">
+                    <div class="dco-sidebar-stat"><span>后端命中</span><b>${getBackendUsageMetrics().hitPercent || 0}%</b></div>
+                    <div class="dco-sidebar-stat"><span>最终前缀</span><b>${lastStats.rawPrefixPercent || 0}%</b></div>
+                    <div class="dco-sidebar-stat"><span>记忆</span><b>${escapeHtml(memoryExtractorStatus.length > 12 ? memoryExtractorStatus.slice(0, 12) + '...' : memoryExtractorStatus)}</b></div>
+                </div>
                 <details class="dco-section" open>
                     <summary class="dco-section-title">缓存优化</summary>
                     <label class="checkbox_label dco-inline" for="dco_enabled">
                         <input id="dco_enabled" type="checkbox" />
-                        <span>启用请求级 Prompt 重排</span>
+                        <span>启用 Prompt 消息重排（关闭后仅保留记忆注入）</span>
                     </label>
                     <label for="dco_strategy">
                         <span>策略</span>
@@ -2679,6 +3601,7 @@ function renderSettings() {
                         <input id="dco_debug" type="checkbox" />
                         <span>浏览器控制台调试日志</span>
                     </label>
+                    <button id="dco_export_prompt" class="menu_button dco-full-btn"><i class="fa-solid fa-file-export"></i> 导出所有快照</button>
                 </details>
                 <div class="dco-muted">
                     重排只修改本次请求；本地记忆使用浏览器 IndexedDB，不修改已保存的预设、世界书、角色卡或聊天记录。
@@ -2693,23 +3616,54 @@ function renderSettings() {
     $('#dco_open_panel').on('click', () => openPanel());
     $('#dco_check_update').on('click', () => checkSelfUpdate());
     $('#dco_update_extension').on('click', () => updateSelfExtension());
+    $('#dco_export_prompt').on('click', () => exportAllSnapshots());
     bindSettings();
 }
 
-export function init() {
+export async function init() {
     getSettings();
     renderSettings();
+    window.dcoExportPrompt = () => exportPromptSnapshot();
+    window.dcoExportAll = () => exportAllSnapshots();
     try {
-        localStorage.removeItem('dco_prevSerialized');
-        localStorage.removeItem('dco_prevHistorySerialized');
+        previousRawContent = localStorage.getItem('dco_prevRawContent') || '';
+        previousRawInput = localStorage.getItem('dco_prevRawInput') || '';
+        previousMergedContent = localStorage.getItem('dco_prevMergedContent') || '';
     } catch { /* localStorage unavailable */ }
+    // Restore request history from IndexedDB
+    try {
+        const snapshots = await loadSnapshotsFromDb();
+        if (snapshots.length) {
+            requestHistory = snapshots.map(snap => ({
+                id: snap.id,
+                at: snap.at,
+                model: snap.model,
+                stream: false,
+                status: snap.usage ? '已收到 usage' : '来自历史',
+                usageReceived: Boolean(snap.usage),
+                usage: snap.usage,
+                stats: snap.stats,
+                messages: snap.messages,
+                messageSignatures: snap.messages.map((m, i) => ({
+                    index: i, role: m.role, length: (m.content || '').length,
+                    hash: m.hash, rich: false, preview: (m.content || '').slice(0, 80),
+                })),
+            }));
+            usageHistory = requestHistory.filter(item => item.usageReceived).slice(0, 20);
+            promptRunCounter = requestHistory.length;
+        }
+    } catch { /* IndexedDB unavailable */ }
     eventSource.on(event_types.CHAT_CHANGED, () => {
         lastRecallResults = [];
         previousSerializedPrompt = '';
-        previousHistoryOnlySerialized = '';
+        previousRawContent = '';
+        previousRawInput = '';
         previousMessageSignatures = [];
+        previousMergedContent = '';
+        previousMergedSignatures = [];
+        mergeAwareAvailable = true;
         promptRunCounter = 0;
-        try { localStorage.removeItem('dco_prevSerialized'); localStorage.removeItem('dco_prevHistorySerialized'); } catch { /* localStorage unavailable */ }
+        try { localStorage.removeItem('dco_prevRawContent'); localStorage.removeItem('dco_prevRawInput'); localStorage.removeItem('dco_prevMergedContent'); } catch { /* localStorage unavailable */ }
     });
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
         runMemoryLlmExtraction().catch(error => console.warn('[DeepSeek Cache Optimizer] Failed to run memory extraction', error));

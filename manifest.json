@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Makim",
-    "version": "0.6.2",
+    "version": "0.6.4-local-a",
     "homePage": "https://github.com/Makima04/st-cache-opt",
     "hooks": {
         "activate": "init"

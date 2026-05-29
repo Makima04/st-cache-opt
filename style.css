@@ -132,6 +132,40 @@
     color: #888;
 }
 
+/* --- Sidebar Quick Stats --- */
+
+#deepseek_cache_optimizer_settings .dco-sidebar-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.3rem;
+    margin: 0.5rem 0;
+    padding: 0.4rem;
+    background: rgba(0, 240, 255, 0.04);
+    border: 1px solid rgba(0, 240, 255, 0.12);
+    border-radius: 2px;
+}
+
+#deepseek_cache_optimizer_settings .dco-sidebar-stat {
+    text-align: center;
+    padding: 0.2rem;
+}
+
+#deepseek_cache_optimizer_settings .dco-sidebar-stat span {
+    display: block;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #888;
+}
+
+#deepseek_cache_optimizer_settings .dco-sidebar-stat b {
+    display: block;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #00f0ff;
+    line-height: 1.2;
+}
+
 #deepseek_cache_optimizer_settings .dco-stats {
     font-size: 0.82rem;
     margin-top: 0.5rem;
