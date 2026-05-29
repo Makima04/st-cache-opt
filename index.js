@@ -171,6 +171,7 @@ let previousHistoryOnlySerialized = '';
 let previousMessageSignatures = [];
 let lastBackendUsage = null;
 let lastGenerationSettings = null;
+let promptRunCounter = 0;
 let usageHistory = [];
 let dbPromise = null;
 let lastRecallResults = [];
@@ -399,6 +400,19 @@ function getWorldInfoTerms() {
 
     lastWorldInfoTerms = [...terms].slice(0, 200);
     return lastWorldInfoTerms;
+}
+
+function getRequestSettingsSignature(settingsRecord = lastGenerationSettings) {
+    if (!settingsRecord) {
+        return '';
+    }
+
+    return hashString(JSON.stringify({
+        source: settingsRecord.source || '',
+        model: settingsRecord.model || '',
+        stream: Boolean(settingsRecord.stream),
+        stream_options: settingsRecord.stream_options || null,
+    }));
 }
 
 function rowText(row, fields = null) {
@@ -886,6 +900,7 @@ async function callMemoryExtractorViaSt(messages, settings) {
     const payload = {
         messages,
         model: getExtractorModel(settings),
+        type: 'dco_memory_extraction',
         chat_completion_source: source,
         include_reasoning: false,
         max_tokens: Number(settings.memoryLlmMaxTokens || defaultSettings.memoryLlmMaxTokens),
@@ -1255,7 +1270,7 @@ function getUsageSummaryText(record = lastBackendUsage) {
 
     const metrics = getUsageMetrics(record.usage);
     return [
-        `来源：${record.source || '未知'} / ${record.model || '未知模型'} / ${record.stream ? '流式' : '非流式'}`,
+        `来源：${record.source || '未知'} / ${record.model || '未知模型'} / ${record.stream ? '流式' : '非流式'} / ${record.type || '主请求'}`,
         `时间：${record.at?.toLocaleString?.() || '未知'}`,
         `prompt_tokens：${formatNumber(metrics.promptTokens)}`,
         `completion_tokens：${formatNumber(metrics.completionTokens)}`,
@@ -1285,8 +1300,54 @@ function getBackendUsageText() {
     return getUsageSummaryText(lastBackendUsage);
 }
 
+function getCacheDiagnosisText(stats = lastStats, usage = lastBackendUsage?.usage) {
+    if (!usage) {
+        return '后端 usage 尚未返回，暂时只能看本地共同前缀。';
+    }
+
+    const metrics = getUsageMetrics(usage);
+    const notes = [];
+
+    if (metrics.cachedTokens <= 0 && Number(stats.prefixPercent || 0) >= 70) {
+        notes.push('本地共同前缀较高但后端没有命中：这通常说明本地比较口径不是后端缓存键，或上游没有复用同一缓存会话。');
+    } else if (metrics.hitPercent < 20 && Number(stats.prefixPercent || 0) >= 70) {
+        notes.push('本地共同前缀较高但后端命中偏低：后端可能按 token 边界、模型参数、网关路由或缓存 TTL 判断，而不是按前端字符前缀判断。');
+    }
+
+    if (Number(stats.stableMessagePrefixChars || 0) > 0 && metrics.cachedTokens > 0) {
+        notes.push(`当前第一处消息变化前约 ${formatNumber(stats.stableMessagePrefixChars)} 文本字符；后端报告命中 ${formatNumber(metrics.cachedTokens)} tokens。两者单位不同，但可用来判断命中是否大致落在首变之前。`);
+    }
+
+    if (Number(stats.runId || 0) <= 1) {
+        notes.push('这是当前页面捕获到的第一个主请求；本地前缀只能和本页之后的请求稳定比较。');
+    }
+
+    const requestSignature = getRequestSettingsSignature(lastGenerationSettings);
+    if (stats.requestSettingsSignature && requestSignature && stats.requestSettingsSignature !== requestSignature) {
+        notes.push('最近请求配置签名发生过变化，模型、源、流式或 stream_options 变化都可能让后端缓存失效。');
+    }
+
+    if (lastGenerationSettings?.stream && !lastGenerationSettings?.stream_options?.include_usage) {
+        notes.push('当前为流式请求，但没有看到 stream_options.include_usage；部分网关可能不会稳定返回最终 usage。');
+    }
+
+    if (lastRecallResults.length > 0 && Number(stats.memoryImpact || 0) > 3) {
+        notes.push('记忆召回正在改变请求前缀；可降低召回条数、提高重要度阈值，或减少最近事件常驻数量。');
+    }
+
+    if (!notes.length) {
+        notes.push('后端 usage 已捕获。本地前缀只用于看趋势，最终以 cached_tokens / prompt_cache_hit_tokens 为准。');
+    }
+
+    return notes.join('\n');
+}
+
 function handleBackendUsage(eventData) {
     if (!eventData?.usage) {
+        return;
+    }
+
+    if (eventData.type === 'dco_memory_extraction') {
         return;
     }
 
@@ -1294,9 +1355,15 @@ function handleBackendUsage(eventData) {
         ...eventData,
         at: new Date(),
     };
+    lastStats = {
+        ...lastStats,
+        requestSettingsSignature: getRequestSettingsSignature(lastGenerationSettings),
+        requestType: lastGenerationSettings?.type || eventData.type || '',
+    };
     usageHistory.unshift({
         ...lastBackendUsage,
         stats: structuredClone(lastStats),
+        settingsSignature: getRequestSettingsSignature(lastGenerationSettings),
     });
     usageHistory = usageHistory.slice(0, 20);
 
@@ -1304,8 +1371,13 @@ function handleBackendUsage(eventData) {
 }
 
 function handleGenerationSettings(generateData) {
+    if (generateData?.type === 'dco_memory_extraction') {
+        return;
+    }
+
     lastGenerationSettings = {
         at: new Date(),
+        type: generateData?.type,
         source: generateData?.chat_completion_source,
         model: generateData?.model,
         stream: Boolean(generateData?.stream),
@@ -1698,13 +1770,17 @@ async function optimizeChatCompletionPrompt(eventData) {
     // Serialize history-only (before memory injection) for comparison
     const historyOnlySerialized = eventData.chat.map(serializeMessage).join('\n');
 
+    promptRunCounter += 1;
     const memoryInjection = buildStructuredInjection(await recallStructuredMemory(eventData.chat));
     if (memoryInjection) {
-        eventData.chat.push({
+        const memoryMessage = {
             role: 'system',
             content: memoryInjection,
             name: 'local_memory_recall',
-        });
+        };
+        const preMemoryAnalysis = eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
+        const boundary = getAnalyzerBoundary(preMemoryAnalysis);
+        eventData.chat.splice(boundary, 0, memoryMessage);
     }
 
     const result = reorderWithAnalyzer(eventData.chat, settings);
@@ -1742,6 +1818,10 @@ async function optimizeChatCompletionPrompt(eventData) {
     const firstChangedMessage = previousMessageSignatures.length
         ? getFirstChangedMessage(messageSignatures, previousMessageSignatures)
         : null;
+    const stableMessagePrefixCount = Number.isInteger(firstChangedMessage) ? firstChangedMessage : messageSignatures.length;
+    const stableMessagePrefixChars = messageSignatures
+        .slice(0, stableMessagePrefixCount)
+        .reduce((sum, item) => sum + Number(item.length || 0), 0);
 
     lastStats = {
         moved: totalMoved,
@@ -1754,21 +1834,21 @@ async function optimizeChatCompletionPrompt(eventData) {
         historyPrefixPercent,
         memoryImpact,
         firstChangedMessage,
+        stableMessagePrefixCount,
+        stableMessagePrefixChars,
         firstMessageHash: messageSignatures[0]?.hash ?? '',
         firstMessageLength: messageSignatures[0]?.length ?? 0,
         messageSignatures,
         promptAnalysis: lastPromptAnalysis,
         dynamicMoved: lastPromptAnalysis.filter(item => item.category === 'dynamic_state' && item.moved).length,
+        runId: promptRunCounter,
+        requestSettingsSignature: '',
+        requestType: '',
     };
 
     previousSerializedPrompt = serializedPrompt;
     previousHistoryOnlySerialized = historyOnlySerialized;
     previousMessageSignatures = messageSignatures;
-    // Persist for cross-reload comparison
-    try {
-        localStorage.setItem('dco_prevSerialized', serializedPrompt);
-        localStorage.setItem('dco_prevHistorySerialized', historyOnlySerialized);
-    } catch { /* quota exceeded or unavailable */ }
     if (settings.debug) {
         console.debug('[DeepSeek Cache Optimizer]', lastStats, eventData.chat);
     }
@@ -1805,11 +1885,15 @@ function updateStats() {
         `历史前缀（无记忆）：${lastStats.historyPrefixChars || 0} 字符（${lastStats.historyPrefixPercent || 0}%）`,
         `记忆破坏量：${lastStats.memoryImpact || 0}%`,
         `第一条发生变化的消息：${firstChanged}`,
+        `稳定消息前缀：${lastStats.stableMessagePrefixCount ?? 0} 条，约 ${lastStats.stableMessagePrefixChars ?? 0} 文本字符`,
         `第一条消息：长度=${lastStats.firstMessageLength || 0}，hash=${lastStats.firstMessageHash || 'n/a'}`,
         `动态块后移：${lastStats.dynamicMoved || 0} 条`,
         `本地记忆：本轮召回 ${lastRecallResults.length} 条`,
         `记忆抽取：${memoryExtractorStatus}`,
         `扩展更新：${getUpdateStatusText()}`,
+        '',
+        '缓存诊断：',
+        getCacheDiagnosisText(),
         '',
         getBackendUsageText(),
         firstChangedText.trim(),
@@ -1838,6 +1922,8 @@ function getTokenEstimateText() {
     return [
         'Token 说明：',
         '当前面板里的长度/共同前缀使用的是请求 JSON 字符数和消息文本长度，不等于模型真实 token。',
+        '共同前缀高只代表前端消息文本相似，不保证 DeepSeek/NewAPI 后端缓存命中。',
+        '后端缓存还可能受模型名、路由节点、请求参数、缓存 TTL、token 边界、账号和上游是否启用缓存影响。',
         'SillyTavern 的本地 token 估算依赖 tokenizer；如果 DeepSeek tokenizer 下载失败，会回退到 llama3 tokenizer，和后端统计会明显对不上。',
         '后端返回的 usage 才是计费与缓存命中的权威数据。',
         'NewAPI 的 OpenAI 兼容返回通常把缓存命中放在 usage.prompt_tokens_details.cached_tokens；有些中转会使用 prompt_cache_hit_tokens / prompt_cache_miss_tokens。',
@@ -1863,7 +1949,7 @@ function getHistoryRows() {
                 <td>${stats.prefixPercent ?? 0}%</td>
                 <td>${stats.historyPrefixPercent ?? 0}%</td>
                 <td>${stats.memoryImpact ?? 0}%</td>
-                <td>${stats.firstChangedMessage ?? '无'}</td>
+                <td>${stats.runId && stats.runId <= 1 ? '本页首次' : (stats.firstChangedMessage ?? '无')}</td>
             </tr>
         `;
     }).join('');
@@ -2068,7 +2154,7 @@ async function openPanel(activeTab = 'optimizer') {
         <div class="dco-panel">
             <div class="dco-panel-header">
                 <h2>DeepSeek Cache Optimizer</h2>
-                <span class="dco-version">v0.5</span>
+                <span class="dco-version">v0.6.1</span>
                 <button id="dco_panel_refresh" class="menu_button" style="margin-left:auto;">刷新</button>
             </div>
             <nav class="dco-tabs">
@@ -2143,6 +2229,8 @@ async function openPanel(activeTab = 'optimizer') {
                     <div class="dco-metric-grid dco-wide-metrics">
                         <div class="dco-metric"><span>历史共同字符</span><b>${stats.historyPrefixChars || 0}</b></div>
                         <div class="dco-metric"><span>第一处变化</span><b>${stats.firstChangedMessage ?? '无'}</b></div>
+                        <div class="dco-metric"><span>稳定消息数</span><b>${stats.stableMessagePrefixCount ?? 0}</b></div>
+                        <div class="dco-metric"><span>稳定字符</span><b>${formatNumber(stats.stableMessagePrefixChars || 0)}</b></div>
                         <div class="dco-metric"><span>消息数</span><b>${stats.total || 0}</b></div>
                     </div>
                     <div class="dco-metric-grid dco-wide-metrics">
@@ -2614,15 +2702,16 @@ function renderSettings() {
 export function init() {
     getSettings();
     renderSettings();
-    // Restore prefix tracking from localStorage (survives page reload)
     try {
-        previousSerializedPrompt = localStorage.getItem('dco_prevSerialized') || '';
-        previousHistoryOnlySerialized = localStorage.getItem('dco_prevHistorySerialized') || '';
+        localStorage.removeItem('dco_prevSerialized');
+        localStorage.removeItem('dco_prevHistorySerialized');
     } catch { /* localStorage unavailable */ }
     eventSource.on(event_types.CHAT_CHANGED, () => {
         lastRecallResults = [];
         previousSerializedPrompt = '';
         previousHistoryOnlySerialized = '';
+        previousMessageSignatures = [];
+        promptRunCounter = 0;
         try { localStorage.removeItem('dco_prevSerialized'); localStorage.removeItem('dco_prevHistorySerialized'); } catch { /* localStorage unavailable */ }
     });
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
