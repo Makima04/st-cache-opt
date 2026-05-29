@@ -1773,14 +1773,11 @@ async function optimizeChatCompletionPrompt(eventData) {
     promptRunCounter += 1;
     const memoryInjection = buildStructuredInjection(await recallStructuredMemory(eventData.chat));
     if (memoryInjection) {
-        const memoryMessage = {
+        eventData.chat.push({
             role: 'system',
             content: memoryInjection,
             name: 'local_memory_recall',
-        };
-        const preMemoryAnalysis = eventData.chat.map((message, index) => classifyPromptMessage(message, index, eventData.chat));
-        const boundary = getAnalyzerBoundary(preMemoryAnalysis);
-        eventData.chat.splice(boundary, 0, memoryMessage);
+        });
     }
 
     const result = reorderWithAnalyzer(eventData.chat, settings);
@@ -2154,7 +2151,7 @@ async function openPanel(activeTab = 'optimizer') {
         <div class="dco-panel">
             <div class="dco-panel-header">
                 <h2>DeepSeek Cache Optimizer</h2>
-                <span class="dco-version">v0.6.1</span>
+                <span class="dco-version">v0.6.2</span>
                 <button id="dco_panel_refresh" class="menu_button" style="margin-left:auto;">刷新</button>
             </div>
             <nav class="dco-tabs">
