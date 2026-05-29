@@ -35,6 +35,12 @@ const defaultSettings = {
     memoryEnabled: false,
     memoryInject: true,
     memoryMaxChronicle: 10,
+    memoryMaxCharacters: 6,
+    memoryMaxItems: 6,
+    memoryMaxRelationships: 6,
+    memoryMaxWorldLore: 4,
+    memoryMinImportance: 0.45,
+    memoryRecentChronicle: 3,
     memoryLlmEnabled: false,
     memoryLlmSource: 'current',
     memoryLlmProvider: 'st',
@@ -403,6 +409,102 @@ function getWorldInfoTerms() {
 
     lastWorldInfoTerms = [...terms].slice(0, 200);
     return lastWorldInfoTerms;
+}
+
+function rowText(row, fields = null) {
+    if (!row) {
+        return '';
+    }
+
+    const source = fields || Object.keys(row).filter(key => key !== '_key' && key !== 'scopeKey');
+    return source.map(key => row[key]).filter(Boolean).join(' ');
+}
+
+function getRecentMessageText(messages, limit = 8) {
+    if (!Array.isArray(messages)) {
+        return '';
+    }
+
+    return messages
+        .slice(-limit)
+        .map(message => getMessageText(message))
+        .filter(Boolean)
+        .join('\n');
+}
+
+function buildMemoryQuery(messages, state, protagonist, userInfo) {
+    return [
+        getRecentMessageText(messages, 8),
+        rowText(state, ['location', 'time', 'scene', 'atmosphere']),
+        rowText(protagonist, ['name', 'currentState', 'traits', 'abilities']),
+        rowText(userInfo, ['name', 'persona']),
+        name1,
+        name2,
+    ].filter(Boolean).join('\n');
+}
+
+function scoreTextAgainstTerms(text, terms, weight = 1) {
+    const haystack = normalizeText(text).toLowerCase();
+    if (!haystack || !terms?.length) {
+        return 0;
+    }
+
+    let score = 0;
+    for (const term of terms) {
+        if (!term) continue;
+        if (haystack.includes(term)) {
+            score += term.length >= 4 ? weight * 1.5 : weight;
+        }
+    }
+
+    return score;
+}
+
+function isExplicitlyMentioned(value, terms, queryText) {
+    const text = normalizeText(value).toLowerCase();
+    if (!text) {
+        return false;
+    }
+
+    if (text.length >= 2 && queryText.includes(text)) {
+        return true;
+    }
+
+    return splitTerms(text).some(term => terms.includes(term));
+}
+
+function pickTopRows(rows, scorer, limit) {
+    const max = Math.max(0, Number(limit || 0));
+    if (!Array.isArray(rows) || max <= 0) {
+        return [];
+    }
+
+    return rows
+        .map((row, index) => ({ row, index, score: scorer(row) }))
+        .filter(item => item.score > 0)
+        .sort((a, b) => b.score - a.score || a.index - b.index)
+        .slice(0, max)
+        .map(item => item.row);
+}
+
+function mergeUniqueRows(rows, keyField, limit) {
+    const max = Math.max(0, Number(limit || 0));
+    const seen = new Set();
+    const merged = [];
+
+    for (const row of rows || []) {
+        const key = String(row?.[keyField] ?? row?._key ?? JSON.stringify(row));
+        if (!key || seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        merged.push(row);
+        if (merged.length >= max) {
+            break;
+        }
+    }
+
+    return merged;
 }
 
 function stripExtractionNoise(text) {
@@ -874,14 +976,97 @@ async function recallStructuredMemory(messages) {
         await putRow('user_info', userInfo);
     }
 
-    // Always inject all data (stable content for cache prefix)
     const maxChronicle = Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle);
-    const relevantChronicle = [...allChronicle]
-        .sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0))
-        .slice(0, maxChronicle);
+    const maxCharacters = Number(settings.memoryMaxCharacters ?? defaultSettings.memoryMaxCharacters);
+    const maxItems = Number(settings.memoryMaxItems ?? defaultSettings.memoryMaxItems);
+    const maxRelationships = Number(settings.memoryMaxRelationships ?? defaultSettings.memoryMaxRelationships);
+    const maxWorldLore = Number(settings.memoryMaxWorldLore ?? defaultSettings.memoryMaxWorldLore);
+    const minImportance = Number(settings.memoryMinImportance ?? defaultSettings.memoryMinImportance);
+    const recentChronicleLimit = Number(settings.memoryRecentChronicle ?? defaultSettings.memoryRecentChronicle);
 
-    lastRecallResults = relevantChronicle;
-    return { state, protagonist, userInfo, activeCharacters: allCharacters, relevantChronicle, items: allItems, relationships: allRelationships, worldLore: allWorldLore };
+    const queryText = normalizeText(buildMemoryQuery(messages, state, protagonist, userInfo)).toLowerCase();
+    const queryTerms = splitTerms(queryText);
+    const worldTerms = getWorldInfoTerms();
+    const actorNames = new Set([name1, name2, protagonist?.name, userInfo?.name].filter(Boolean).map(value => normalizeText(value).toLowerCase()));
+
+    for (const row of allCharacters) {
+        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) {
+            actorNames.add(normalizeText(row.name).toLowerCase());
+        }
+    }
+
+    const activeCharacters = pickTopRows(allCharacters, row => {
+        const text = rowText(row, ['name', 'role', 'relationship', 'status', 'traits', 'lastInteraction']);
+        let score = scoreTextAgainstTerms(text, queryTerms, 1.5);
+        score += scoreTextAgainstTerms(text, worldTerms, 0.35);
+        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) score += 8;
+        if (row.relationship && scoreTextAgainstTerms(row.relationship, queryTerms, 1) > 0) score += 2;
+        return score;
+    }, maxCharacters);
+
+    for (const row of activeCharacters) {
+        if (row.name) {
+            actorNames.add(normalizeText(row.name).toLowerCase());
+        }
+    }
+
+    const relationships = pickTopRows(allRelationships, row => {
+        const text = rowText(row, ['relKey', 'fromChar', 'toChar', 'type', 'value', 'notes']);
+        const from = normalizeText(row.fromChar).toLowerCase();
+        const to = normalizeText(row.toChar).toLowerCase();
+        let score = scoreTextAgainstTerms(text, queryTerms, 1.25);
+        score += scoreTextAgainstTerms(text, worldTerms, 0.25);
+        if (from && actorNames.has(from)) score += 3;
+        if (to && actorNames.has(to)) score += 3;
+        if (isExplicitlyMentioned(row.relKey, queryTerms, queryText)) score += 4;
+        return score;
+    }, maxRelationships);
+
+    const items = pickTopRows(allItems, row => {
+        const text = rowText(row, ['name', 'type', 'owner', 'description', 'location', 'status']);
+        const owner = normalizeText(row.owner).toLowerCase();
+        let score = scoreTextAgainstTerms(text, queryTerms, 1.25);
+        score += scoreTextAgainstTerms(text, worldTerms, 0.25);
+        if (isExplicitlyMentioned(row.name, queryTerms, queryText)) score += 6;
+        if (owner && actorNames.has(owner)) score += 2;
+        if (state?.location && normalizeText(row.location).toLowerCase().includes(normalizeText(state.location).toLowerCase())) score += 1;
+        return score;
+    }, maxItems);
+
+    const worldLore = pickTopRows(allWorldLore, row => {
+        const text = rowText(row, ['key', 'category', 'content']);
+        let score = scoreTextAgainstTerms(text, queryTerms, 1.2);
+        score += scoreTextAgainstTerms(text, worldTerms, 0.6);
+        if (isExplicitlyMentioned(row.key, queryTerms, queryText)) score += 6;
+        return score;
+    }, maxWorldLore);
+
+    const chronicleByTurn = [...allChronicle]
+        .sort((a, b) => Number(b.turn || 0) - Number(a.turn || 0));
+    const recentChronicle = chronicleByTurn.slice(0, Math.max(0, recentChronicleLimit));
+    const scoredChronicle = allChronicle
+        .map((row, index) => {
+            const text = rowText(row, ['amCode', 'summary', 'entities', 'keywords']);
+            const importance = Number(row.importance || 0);
+            const relevance = scoreTextAgainstTerms(text, queryTerms, 1.25) + scoreTextAgainstTerms(text, worldTerms, 0.25);
+            const explicit = isExplicitlyMentioned(row.amCode, queryTerms, queryText) ? 4 : 0;
+            const entityBoost = scoreTextAgainstTerms(row.entities, [...actorNames], 0.75);
+            return { row, index, score: relevance + explicit + entityBoost + Math.max(importance, 0) };
+        })
+        .filter(item => item.score > 0 && (Number(item.row.importance || 0) >= minImportance || item.score >= 2.5))
+        .sort((a, b) => b.score - a.score || Number(b.row.turn || 0) - Number(a.row.turn || 0) || a.index - b.index)
+        .map(item => item.row);
+    const relevantChronicle = mergeUniqueRows([...recentChronicle, ...scoredChronicle], 'amCode', maxChronicle);
+
+    lastRecallResults = [
+        ...activeCharacters.map(record => ({ type: 'character', record })),
+        ...relationships.map(record => ({ type: 'relationship', record })),
+        ...items.map(record => ({ type: 'item', record })),
+        ...worldLore.map(record => ({ type: 'world_lore', record })),
+        ...relevantChronicle.map(record => ({ type: 'chronicle', record })),
+    ];
+
+    return { state, protagonist, userInfo, activeCharacters, relevantChronicle, items, relationships, worldLore };
 }
 
 function buildStructuredInjection(memory) {
@@ -1988,6 +2173,30 @@ async function openPanel(activeTab = 'optimizer') {
                                 <span>最大编年史召回条数</span>
                                 <input id="dco_memory_max_chronicle_modal" class="text_pole" type="number" min="1" max="50" value="${Number(settings.memoryMaxChronicle || defaultSettings.memoryMaxChronicle)}" />
                             </label>
+                            <label>
+                                <span>最多角色召回条数</span>
+                                <input id="dco_memory_max_characters_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxCharacters ?? defaultSettings.memoryMaxCharacters)}" />
+                            </label>
+                            <label>
+                                <span>最多物品召回条数</span>
+                                <input id="dco_memory_max_items_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxItems ?? defaultSettings.memoryMaxItems)}" />
+                            </label>
+                            <label>
+                                <span>最多关系召回条数</span>
+                                <input id="dco_memory_max_relationships_modal" class="text_pole" type="number" min="0" max="50" value="${Number(settings.memoryMaxRelationships ?? defaultSettings.memoryMaxRelationships)}" />
+                            </label>
+                            <label>
+                                <span>最多世界观召回条数</span>
+                                <input id="dco_memory_max_world_lore_modal" class="text_pole" type="number" min="0" max="30" value="${Number(settings.memoryMaxWorldLore ?? defaultSettings.memoryMaxWorldLore)}" />
+                            </label>
+                            <label>
+                                <span>常保留最近编年史</span>
+                                <input id="dco_memory_recent_chronicle_modal" class="text_pole" type="number" min="0" max="20" value="${Number(settings.memoryRecentChronicle ?? defaultSettings.memoryRecentChronicle)}" />
+                            </label>
+                            <label>
+                                <span>编年史最低重要度</span>
+                                <input id="dco_memory_min_importance_modal" class="text_pole" type="number" min="0" max="1" step="0.05" value="${Number(settings.memoryMinImportance ?? defaultSettings.memoryMinImportance)}" />
+                            </label>
                         </div>
                         <div class="dco-muted">当前作用域：${escapeHtml(getMemoryScope().scopeKey)}。</div>
                     </section>
@@ -2145,6 +2354,12 @@ async function openPanel(activeTab = 'optimizer') {
     html.find('#dco_memory_enabled_modal').on('input', function () { settings.memoryEnabled = Boolean(this.checked); persist(); });
     html.find('#dco_memory_inject_modal').on('input', function () { settings.memoryInject = Boolean(this.checked); persist(); });
     html.find('#dco_memory_max_chronicle_modal').on('input', function () { settings.memoryMaxChronicle = Number(this.value || defaultSettings.memoryMaxChronicle); persist(); });
+    html.find('#dco_memory_max_characters_modal').on('input', function () { settings.memoryMaxCharacters = this.value === '' ? defaultSettings.memoryMaxCharacters : Number(this.value); persist(); });
+    html.find('#dco_memory_max_items_modal').on('input', function () { settings.memoryMaxItems = this.value === '' ? defaultSettings.memoryMaxItems : Number(this.value); persist(); });
+    html.find('#dco_memory_max_relationships_modal').on('input', function () { settings.memoryMaxRelationships = this.value === '' ? defaultSettings.memoryMaxRelationships : Number(this.value); persist(); });
+    html.find('#dco_memory_max_world_lore_modal').on('input', function () { settings.memoryMaxWorldLore = this.value === '' ? defaultSettings.memoryMaxWorldLore : Number(this.value); persist(); });
+    html.find('#dco_memory_recent_chronicle_modal').on('input', function () { settings.memoryRecentChronicle = this.value === '' ? defaultSettings.memoryRecentChronicle : Number(this.value); persist(); });
+    html.find('#dco_memory_min_importance_modal').on('input', function () { settings.memoryMinImportance = this.value === '' ? defaultSettings.memoryMinImportance : Number(this.value); persist(); });
     html.find('#dco_memory_llm_enabled_modal').on('input', function () { settings.memoryLlmEnabled = Boolean(this.checked); persist(); });
     html.find('#dco_memory_llm_model_modal').on('input', function () { settings.memoryLlmModel = String(this.value || ''); persist(); });
     html.find('#dco_memory_llm_model_select').on('change', function () { settings.memoryLlmModel = String(this.value || ''); persist(); });
