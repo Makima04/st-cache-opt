@@ -16,11 +16,11 @@ After installation, reload the browser tab and enable `DeepSeek 缓存优化器`
 
 ## Update
 
-If you installed this extension with SillyTavern's extension installer, use `检查更新` / `更新扩展` inside the extension panel. Reload the page after an update.
+If you installed this extension with SillyTavern's extension installer, use `Check for updates` / `Update extension` inside the extension panel. Reload the page after an update.
 
 If you installed it manually, download the repository again and overwrite the old files.
 
-## Manual install
+## Manual Install
 
 Copy this repository folder to:
 
@@ -39,28 +39,16 @@ It runs a local Prompt Analyzer and reorders only movable pre-history blocks for
 - stable character and preset prompts first
 - stable rules, world context, and format rules early
 - variable update schema before variable values
-- current state, local recall, and dynamic variables later
+- current state and dynamic variables later
 - chat history and the latest user input stay in their semantic positions
 
 It does not modify saved presets, world books, character cards, or chat history.
 
-## Rich Format / Front-End Cards
+## Request Recording And Diagnostics
 
-Some character cards include HTML/CSS panels, diaries, stat screens, `<details>` blocks, or Markdown code fences that render as a front-end page. These blocks should be treated as atomic content.
+When diagnostics and request history are enabled, the extension records request snapshots in browser IndexedDB. Snapshots are still retained when the backend does not return `usage`.
 
-The `Protect rich HTML/CSS message blocks` option detects likely rich-format blocks and pins them in place. The optimizer will not split, merge, summarize, or move those blocks independently.
-
-For best results, keep the whole UI block in one message or one world info entry. Avoid mixing a large HTML/CSS panel with unrelated lore text in the same entry.
-
-## Why This Helps Cache Hits
-
-DeepSeek context cache hits require a stable token prefix. In SillyTavern, world info, extension prompts, and dynamic state blocks can appear before stable character information, so a small change in activated lore may invalidate the remaining prefix.
-
-This extension moves more stable content earlier and places frequently changing blocks after the stable prefix, improving the chance that DeepSeek can reuse cached prefix tokens.
-
-## Backend Usage And Real Cached Tokens
-
-The panel can show backend `usage` only when SillyTavern or the upstream gateway returns and exposes that field.
+Backend `usage` is used only when SillyTavern or the upstream gateway returns and exposes it. Missing usage or missing debug endpoints must not block generation or prompt reordering.
 
 For OpenAI-compatible / NewAPI routes:
 
@@ -71,48 +59,14 @@ For OpenAI-compatible / NewAPI routes:
 
 Local common-prefix diagnostics are character-based and only indicate cache-stability trends. Backend `usage` or the model provider dashboard remains the authority for billing tokens and cache hits.
 
-## Local Memory Recall Without Vectors
+## Rich Format / Front-End Cards
 
-Version 0.5 adds an optional browser-local memory recall layer. It is off by default.
+Some character cards include HTML/CSS panels, diaries, stat screens, `<details>` blocks, or Markdown code fences that render as a front-end page. These blocks should be treated as atomic content.
 
-When enabled, the extension stores compact memory records for the current character/chat in IndexedDB. It does not modify SillyTavern chat files, presets, world books, or character cards.
+The `Protect rich HTML/CSS message blocks` option detects likely rich-format blocks and pins them in place. The optimizer will not split, merge, summarize, or move those blocks independently.
 
-Recall uses:
+For best results, keep the whole UI block in one message or one world info entry. Avoid mixing a large HTML/CSS panel with unrelated lore text in the same entry.
 
-- exact entity matches from character names and world book keys
-- keyword matches from message text
-- world book key/reference matches
-- memory type priority, importance, and recency
+## Memory System Removed
 
-The recalled block is inserted as a short system message before chat history:
-
-```text
-[长期记忆召回]
-- event / 第42轮 / 相关度8.5: ...
-```
-
-For cache stability, keep recalled item count and character budget small. The dynamic memory block is inserted after the stable prompt prefix.
-
-## Independent LLM Memory Extraction
-
-The extension can optionally use a separate LLM to extract structured long-term memories:
-
-- default mode reuses SillyTavern's backend connection and stored API key
-- direct mode lets the user enter an OpenAI-compatible API URL, API key, and model
-- extracted records are stored in browser IndexedDB
-- recall remains local and deterministic; the chat generation model is not used for background extraction
-
-The extractor expects JSON with:
-
-```json
-{
-  "events": [],
-  "states": [],
-  "goals": [],
-  "relationships": [],
-  "rules": [],
-  "obsolete_memory_ids": []
-}
-```
-
-Direct API keys are stored in extension settings in the browser. For shared or public deployments, prefer the SillyTavern backend mode.
+The browser-local memory recall and independent LLM memory extraction features have been removed from this build. The extension now focuses on prompt reordering, diagnostics, backend usage capture, and request snapshot recording.

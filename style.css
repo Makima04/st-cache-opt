@@ -766,66 +766,6 @@
     box-shadow: 0 0 10px rgba(255, 42, 109, 0.4);
 }
 
-/* --- Responsive --- */
-
-/* --- Model Picker --- */
-
-.dco-model-picker {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.25rem;
-}
-
-.dco-model-picker select,
-.dco-model-picker input {
-    flex: 1;
-    min-width: 0;
-    background: #0d0d0d;
-    color: #e0e0e0;
-    border: 1px solid rgba(0, 240, 255, 0.2);
-    border-radius: 2px;
-    font-family: 'Rajdhani', 'Segoe UI', sans-serif;
-    font-size: 0.88rem;
-    padding: 0.3rem 0.4rem;
-}
-
-.dco-model-picker select:focus,
-.dco-model-picker input:focus {
-    border-color: #fcee09;
-    outline: none;
-    box-shadow: 0 0 6px rgba(252, 238, 9, 0.2);
-}
-
-.dco-model-picker .menu_button {
-    flex-shrink: 0;
-    padding: 0.3rem 0.5rem;
-    font-size: 0.85rem;
-    min-width: 2rem;
-}
-
-.dco-manual-toggle {
-    flex-shrink: 0;
-    gap: 0.25rem;
-}
-
-.dco-manual-toggle span {
-    font-size: 0.78rem;
-    color: #aaa;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-}
-
-/* --- Memory Detail Row --- */
-
-.dco-memory-row {
-    cursor: pointer;
-}
-
-.dco-memory-row:hover {
-    background: rgba(252, 238, 9, 0.06) !important;
-}
-
 .dco-json-detail {
     margin: 0;
     padding: 0.6rem;
