@@ -39,7 +39,7 @@ It runs a local Prompt Analyzer and reorders only movable pre-history blocks for
 - stable character and preset prompts first
 - stable rules, world context, and format rules early
 - variable update schema before variable values
-- current state and dynamic variables later
+- current state and dynamic variables after chat history and before the latest user input
 - chat history and the latest user input stay in their semantic positions
 
 It does not modify saved presets, world books, character cards, or chat history.

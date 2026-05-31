@@ -1696,27 +1696,52 @@ function shouldPromoteAcrossHistory(item, settings) {
     return ['stable_rule', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'unknown_stable'].includes(item.category);
 }
 
+function shouldMoveDynamicAfterHistory(item, settings) {
+    if (!shouldAnalyzerMove(item, settings)) {
+        return false;
+    }
+
+    return item.category === 'dynamic_state';
+}
+
 function reorderWithAnalyzer(messages, settings) {
     const analysis = messages.map((message, index) => classifyPromptMessage(message, index, messages));
     const promotable = analysis.filter(item => shouldPromoteAcrossHistory(item, settings));
-    if (promotable.length < Number(settings.minPrefixMessages || defaultSettings.minPrefixMessages)) {
+    const minPrefixMessages = Number(settings.minPrefixMessages || defaultSettings.minPrefixMessages);
+    const effectivePromotable = promotable.length >= minPrefixMessages ? promotable : [];
+    const dynamicTail = analysis.filter(item => shouldMoveDynamicAfterHistory(item, settings));
+    if (!effectivePromotable.length && !dynamicTail.length) {
         return { changed: false, messages, moved: 0, protected: analysis.filter(item => item.category === 'rich_format').length, analysis };
     }
 
-    const promotedIndexes = new Set(promotable.map(item => item.index));
-    const orderedPromoted = promotable
+    const movedIndexes = new Set([...effectivePromotable, ...dynamicTail].map(item => item.index));
+    const orderedPromoted = effectivePromotable
         .slice()
         .sort((a, b) => a.order - b.order || a.index - b.index)
         .map(item => messages[item.index]);
+    const orderedDynamicTail = dynamicTail
+        .slice()
+        .sort((a, b) => a.index - b.index)
+        .map(item => messages[item.index]);
     const remaining = analysis
-        .filter(item => !promotedIndexes.has(item.index))
+        .filter(item => !movedIndexes.has(item.index))
         .map(item => ({ item, message: messages[item.index] }));
-    const insertAt = remaining.findIndex(({ item }) => item.category === 'chat_history' || item.category === 'latest_input');
-    const insertionIndex = insertAt === -1 ? remaining.length : insertAt;
-    const reordered = [
-        ...remaining.slice(0, insertionIndex).map(entry => entry.message),
+    const stableInsertAt = remaining.findIndex(({ item }) => item.category === 'chat_history' || item.category === 'latest_input');
+    const stableInsertionIndex = stableInsertAt === -1 ? remaining.length : stableInsertAt;
+    const withStablePrefix = [
+        ...remaining.slice(0, stableInsertionIndex).map(entry => entry.message),
         ...orderedPromoted,
-        ...remaining.slice(insertionIndex).map(entry => entry.message),
+        ...remaining.slice(stableInsertionIndex).map(entry => entry.message),
+    ];
+    const dynamicInsertAt = withStablePrefix.findIndex(message => {
+        const item = analysis.find(entry => messages[entry.index] === message);
+        return item?.category === 'latest_input';
+    });
+    const dynamicInsertionIndex = dynamicInsertAt === -1 ? withStablePrefix.length : dynamicInsertAt;
+    const reordered = [
+        ...withStablePrefix.slice(0, dynamicInsertionIndex),
+        ...orderedDynamicTail,
+        ...withStablePrefix.slice(dynamicInsertionIndex),
     ];
     const changed = reordered.some((message, index) => message !== messages[index]);
     const nextAnalysis = reordered.map((message, index) => {
