@@ -22,6 +22,9 @@ const defaultSettings = {
     moveJailbreakAfterHistory: false,
     protectRichFormat: true,
     minPrefixMessages: 2,
+    adaptiveStableReorder: true,
+    adaptiveSampleSize: 3,
+    adaptiveHitRateThreshold: 20,
     debug: false,
     diagnosticsEnabled: false,
     recordRequestHistory: false,
@@ -123,9 +126,16 @@ let updateRunning = false;
 let backendBodyRecords = [];
 let fetchPatched = false;
 let backendDebugUnavailable = false;
+let adaptivePromptSamples = [];
+let adaptiveStableHashes = [];
+let adaptiveStableHashSet = new Set();
+let adaptiveStableOrder = new Map();
+let adaptivePlanLocked = false;
+let adaptivePlanReason = '等待 3 次请求样本';
 
 const promptCategoryLabels = {
     stable_rule: '稳定规则',
+    adaptive_stable: '自适应稳定',
     character_static: '角色静态',
     world_static: '世界静态',
     format_rule: '格式规则',
@@ -1385,6 +1395,32 @@ function isStablePromptLikeMessage(message) {
         || isWorldStaticMessageText(normalized);
 }
 
+function isAdaptiveCandidate(message, index, messages) {
+    const text = getMessageText(message);
+    if (!text || isRichFormatMessage(message) || isHardDynamicMessage(message) || isHistoryMarkerMessage(message)) {
+        return false;
+    }
+
+    if (message?.tool_calls || message?.tool_call_id) {
+        return false;
+    }
+
+    const role = message?.role || '';
+    if (role === 'assistant' || role === 'tool') {
+        return false;
+    }
+
+    if (role === 'user') {
+        return index !== getLatestUserMessageIndex(messages);
+    }
+
+    return role === 'system' || role === 'developer';
+}
+
+function getAdaptiveStableOrder(hash) {
+    return adaptiveStableOrder.has(hash) ? adaptiveStableOrder.get(hash) : 240;
+}
+
 function classifyPromptMessage(message, index, messages) {
     const text = getMessageText(message);
     const normalized = normalizeText(text);
@@ -1418,6 +1454,22 @@ function classifyPromptMessage(message, index, messages) {
             reason: '检测到 HTML/CSS/前端页面块，原位保护',
             length: text.length,
             hash: hashString(serializeMessage(message)),
+            preview: normalized.slice(0, 80),
+        };
+    }
+
+    const messageHash = hashString(serializeMessage(message));
+    if (adaptiveStableHashSet.has(messageHash) && isAdaptiveCandidate(message, index, messages)) {
+        return {
+            index,
+            role,
+            category: 'adaptive_stable',
+            stability: 'stable',
+            movable: true,
+            order: getAdaptiveStableOrder(messageHash),
+            reason: '连续 3 次请求内容相同且低命中率触发，锁定为自适应稳定块',
+            length: text.length,
+            hash: messageHash,
             preview: normalized.slice(0, 80),
         };
     }
@@ -1682,10 +1734,10 @@ function shouldAnalyzerMove(item, settings) {
     }
 
     if (settings.strategy === 'conservative') {
-        return ['stable_rule', 'character_static', 'format_rule', 'variable_schema', 'dynamic_state', 'history_marker'].includes(item.category);
+        return ['stable_rule', 'adaptive_stable', 'character_static', 'format_rule', 'variable_schema', 'dynamic_state', 'history_marker'].includes(item.category);
     }
 
-    return ['stable_rule', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'dynamic_state', 'history_marker', 'unknown_stable', 'empty'].includes(item.category);
+    return ['stable_rule', 'adaptive_stable', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'dynamic_state', 'history_marker', 'unknown_stable', 'empty'].includes(item.category);
 }
 
 function shouldPromoteAcrossHistory(item, settings) {
@@ -1693,7 +1745,7 @@ function shouldPromoteAcrossHistory(item, settings) {
         return false;
     }
 
-    return ['stable_rule', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'unknown_stable'].includes(item.category);
+    return ['stable_rule', 'adaptive_stable', 'character_static', 'world_static', 'format_rule', 'variable_schema', 'unknown_stable'].includes(item.category);
 }
 
 function shouldMoveDynamicAfterHistory(item, settings) {
@@ -1704,8 +1756,94 @@ function shouldMoveDynamicAfterHistory(item, settings) {
     return item.category === 'dynamic_state';
 }
 
+function getAdaptiveSampleSignatures(messages) {
+    return messages
+        .map((message, index) => ({
+            index,
+            hash: hashString(serializeMessage(message)),
+            role: message?.role || '',
+            textLength: getMessageText(message).length,
+            candidate: isAdaptiveCandidate(message, index, messages),
+        }))
+        .filter(item => item.candidate);
+}
+
+function resetAdaptiveStablePlan(reason = '等待 3 次请求样本') {
+    adaptivePromptSamples = [];
+    adaptiveStableHashes = [];
+    adaptiveStableHashSet = new Set();
+    adaptiveStableOrder = new Map();
+    adaptivePlanLocked = false;
+    adaptivePlanReason = reason;
+}
+
+function getRecentBackendHitRate() {
+    const metrics = getBackendUsageMetrics();
+    if (metrics.promptTokens > 0) {
+        return metrics.hitPercent;
+    }
+
+    const recent = usageHistory.find(item => item?.usage);
+    return recent ? getUsageMetrics(recent.usage).hitPercent : null;
+}
+
+function updateAdaptiveStablePlan(messages, settings) {
+    if (!settings.adaptiveStableReorder) {
+        adaptivePlanReason = '自适应稳定块识别已关闭';
+        return;
+    }
+
+    if (adaptivePlanLocked) {
+        return;
+    }
+
+    const sampleSize = Math.max(2, Number(settings.adaptiveSampleSize || defaultSettings.adaptiveSampleSize));
+    adaptivePromptSamples.push(getAdaptiveSampleSignatures(messages));
+    adaptivePromptSamples = adaptivePromptSamples.slice(-sampleSize);
+
+    if (adaptivePromptSamples.length < sampleSize) {
+        adaptivePlanReason = `采样中：${adaptivePromptSamples.length}/${sampleSize}`;
+        return;
+    }
+
+    const hitRate = getRecentBackendHitRate();
+    const threshold = Number(settings.adaptiveHitRateThreshold ?? defaultSettings.adaptiveHitRateThreshold);
+    if (hitRate !== null && hitRate >= threshold) {
+        adaptivePlanReason = `后端命中率 ${hitRate}% 已达到 ${threshold}%，暂不启用自适应前置`;
+        return;
+    }
+
+    const counts = new Map();
+    const firstSeen = new Map();
+    for (const sample of adaptivePromptSamples) {
+        const seenInSample = new Set();
+        for (const item of sample) {
+            if (seenInSample.has(item.hash)) {
+                continue;
+            }
+            seenInSample.add(item.hash);
+            counts.set(item.hash, (counts.get(item.hash) || 0) + 1);
+            if (!firstSeen.has(item.hash)) {
+                firstSeen.set(item.hash, item.index);
+            }
+        }
+    }
+
+    adaptiveStableHashes = [...counts.entries()]
+        .filter(([, count]) => count >= sampleSize)
+        .map(([hash]) => hash)
+        .sort((a, b) => (firstSeen.get(a) ?? 9999) - (firstSeen.get(b) ?? 9999));
+    adaptiveStableHashSet = new Set(adaptiveStableHashes);
+    adaptiveStableOrder = new Map(adaptiveStableHashes.map((hash, index) => [hash, 220 + index]));
+    adaptivePlanLocked = adaptiveStableHashes.length > 0;
+    adaptivePlanReason = adaptivePlanLocked
+        ? `已锁定 ${adaptiveStableHashes.length} 个连续 ${sampleSize} 次相同的稳定块；触发命中率：${hitRate ?? '未知'}%`
+        : `连续 ${sampleSize} 次没有发现可安全前置的相同块`;
+}
+
 function reorderWithAnalyzer(messages, settings) {
     const analysis = messages.map((message, index) => classifyPromptMessage(message, index, messages));
+    updateAdaptiveStablePlan(messages, settings);
     const promotable = analysis.filter(item => shouldPromoteAcrossHistory(item, settings));
     const minPrefixMessages = Number(settings.minPrefixMessages || defaultSettings.minPrefixMessages);
     const effectivePromotable = promotable.length >= minPrefixMessages ? promotable : [];
@@ -1882,6 +2020,9 @@ async function optimizeChatCompletionPrompt(eventData) {
         messageSignatures,
         promptAnalysis: lastPromptAnalysis,
         dynamicMoved: lastPromptAnalysis.filter(item => item.category === 'dynamic_state' && item.moved).length,
+        adaptiveStableCount: adaptiveStableHashes.length,
+        adaptivePlanLocked,
+        adaptivePlanReason,
         runId: promptRunCounter,
         requestSettingsSignature: '',
         requestType: '',
@@ -1957,6 +2098,7 @@ function updateStats() {
         `合并后稳定消息：${lastStats.mergedMessagePrefixCount ?? 'N/A'} / ${lastStats.mergedTotalMessages ?? 'N/A'} 条`,
         `第一条消息：长度=${lastStats.firstMessageLength || 0}，hash=${lastStats.firstMessageHash || 'n/a'}`,
         `动态块后移：${lastStats.dynamicMoved || 0} 条`,
+        `自适应稳定块：${lastStats.adaptiveStableCount || 0} 条；${lastStats.adaptivePlanReason || adaptivePlanReason}`,
         `扩展更新：${getUpdateStatusText()}`,
         '',
         '缓存诊断：',
@@ -2460,6 +2602,7 @@ function bindSettings() {
     $('#dco_enabled').prop('checked', settings.enabled);
     $('#dco_strategy').val(settings.strategy).closest('label').toggle(settings.enabled);
     $('#dco_protect_rich_format').prop('checked', settings.protectRichFormat).closest('label').toggle(settings.enabled);
+    $('#dco_adaptive_stable_reorder').prop('checked', settings.adaptiveStableReorder).closest('label').toggle(settings.enabled);
     $('#dco_debug').prop('checked', settings.debug);
     $('#dco_diagnostics_enabled').prop('checked', settings.diagnosticsEnabled);
     $('#dco_record_request_history').prop('checked', settings.recordRequestHistory).closest('label').toggle(settings.diagnosticsEnabled);
@@ -2477,6 +2620,13 @@ function bindSettings() {
     });
     $('#dco_protect_rich_format').on('input', function () {
         settings.protectRichFormat = Boolean(this.checked);
+        saveSettingsDebounced();
+    });
+    $('#dco_adaptive_stable_reorder').on('input', function () {
+        settings.adaptiveStableReorder = Boolean(this.checked);
+        if (!settings.adaptiveStableReorder) {
+            resetAdaptiveStablePlan('自适应稳定块识别已关闭');
+        }
         saveSettingsDebounced();
     });
     $('#dco_debug').on('input', function () {
@@ -2540,6 +2690,10 @@ function renderSettings() {
                     <label class="checkbox_label dco-inline" for="dco_protect_rich_format">
                         <input id="dco_protect_rich_format" type="checkbox" />
                         <span>保护 HTML/CSS 富格式块</span>
+                    </label>
+                    <label class="checkbox_label dco-inline" for="dco_adaptive_stable_reorder">
+                        <input id="dco_adaptive_stable_reorder" type="checkbox" />
+                        <span>低命中率时采样 3 次并锁定相同稳定块</span>
                     </label>
                 </details>
                 <details class="dco-section">
@@ -2632,6 +2786,7 @@ export async function init() {
         previousMergedSignatures = [];
         mergeAwareAvailable = true;
         promptRunCounter = 0;
+        resetAdaptiveStablePlan('聊天已切换，等待 3 次请求样本');
         try { localStorage.removeItem('dco_prevRawContent'); localStorage.removeItem('dco_prevRawInput'); localStorage.removeItem('dco_prevMergedContent'); } catch { /* localStorage unavailable */ }
     });
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, handleGenerationSettings);
