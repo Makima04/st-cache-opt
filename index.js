@@ -441,6 +441,21 @@ function makeRequestRecord({ messages, stats, analysis, serializedPrompt, merged
     };
 }
 
+function getGenerateRequestMessages(requestJson = {}) {
+    return Array.isArray(requestJson?.messages) ? requestJson.messages : [];
+}
+
+function areMessageSignaturesEqual(left = [], right = []) {
+    if (left.length !== right.length) {
+        return false;
+    }
+
+    return left.every((item, index) => {
+        const other = right[index];
+        return item?.role === other?.role && item?.hash === other?.hash;
+    });
+}
+
 function rememberRequestRecord(record) {
     const settings = getSettings();
     if (!settings.diagnosticsEnabled || !settings.recordRequestHistory) {
@@ -452,8 +467,119 @@ function rememberRequestRecord(record) {
     saveSnapshotToDb(record);
 }
 
+function rememberRequestRecordFromFetch(requestBody, requestJson = {}) {
+    const settings = getSettings();
+    if (!settings.diagnosticsEnabled || !settings.recordRequestHistory) {
+        return null;
+    }
+
+    const messages = getGenerateRequestMessages(requestJson);
+    if (!messages.length) {
+        return null;
+    }
+
+    const messageSignatures = getMessageSignatures(messages);
+    const latest = requestHistory[0] || null;
+    const source = requestJson.chat_completion_source || lastGenerationSettings?.source || '';
+    const model = requestJson.model || lastGenerationSettings?.model || '';
+    const type = requestJson.type || lastGenerationSettings?.type || '';
+    const stream = Boolean(requestJson.stream ?? lastGenerationSettings?.stream);
+    const settingsSignature = getRequestSettingsSignature({
+        source,
+        model,
+        stream,
+        type,
+        stream_options: requestJson.stream_options || lastGenerationSettings?.stream_options,
+    });
+
+    if (latest && !latest.usageReceived && areMessageSignaturesEqual(latest.messageSignatures || [], messageSignatures)) {
+        latest.source = source || latest.source;
+        latest.model = model || latest.model;
+        latest.stream = stream;
+        latest.type = type || latest.type;
+        latest.settingsSignature = settingsSignature;
+        latest.requestBodyHash = hashString(typeof requestBody === 'string' ? requestBody : '');
+        saveSnapshotToDb(latest);
+        return latest;
+    }
+
+    promptRunCounter += 1;
+    const rawContentAfter = serializeRawContent(messages);
+    const rawPrefixChars = previousRawContent ? getCommonPrefixLength(previousRawContent, rawContentAfter) : 0;
+    const rawPrefixPercent = previousRawContent
+        ? Math.round((rawPrefixChars / Math.max(rawContentAfter.length, 1)) * 10000) / 100
+        : 0;
+    const firstChangedMessage = previousMessageSignatures.length
+        ? getFirstChangedMessage(messageSignatures, previousMessageSignatures)
+        : null;
+    const stableMessagePrefixCount = Number.isInteger(firstChangedMessage) ? firstChangedMessage : messageSignatures.length;
+    const stableMessagePrefixChars = messageSignatures
+        .slice(0, stableMessagePrefixCount)
+        .reduce((sum, item) => sum + Number(item.length || 0), 0);
+
+    const fallbackStats = {
+        ...lastStats,
+        moved: 0,
+        total: messages.length,
+        skipped: '由实际生成请求记录',
+        rawPrefixChars,
+        rawPrefixPercent,
+        firstChangedMessage,
+        stableMessagePrefixCount,
+        stableMessagePrefixChars,
+        firstMessageHash: messageSignatures[0]?.hash ?? '',
+        firstMessageLength: messageSignatures[0]?.length ?? 0,
+        messageSignatures,
+        promptAnalysis: [],
+        runId: promptRunCounter,
+        requestSettingsSignature: settingsSignature,
+        requestType: type,
+    };
+    lastStats = fallbackStats;
+
+    const record = makeRequestRecord({
+        messages,
+        stats: fallbackStats,
+        analysis: [],
+        serializedPrompt: messages.map(serializeMessage).join('\n'),
+        mergedMessages: null,
+    });
+    record.status = '已捕获请求';
+    record.source = source;
+    record.model = model;
+    record.stream = stream;
+    record.type = type;
+    record.settingsSignature = settingsSignature;
+    record.requestBodyHash = hashString(typeof requestBody === 'string' ? requestBody : '');
+
+    rememberRequestRecord(record);
+
+    previousSerializedPrompt = record.serializedPrompt;
+    previousRawContent = rawContentAfter;
+    previousRawInput = rawContentAfter;
+    previousMessageSignatures = messageSignatures;
+    try {
+        localStorage.setItem('dco_prevRawContent', rawContentAfter);
+        localStorage.setItem('dco_prevRawInput', rawContentAfter);
+    } catch { /* quota exceeded */ }
+
+    updateStats();
+    return record;
+}
+
 function updateLatestRequestWithUsage(eventData) {
-    const record = requestHistory.find(item => !item.usageReceived);
+    const record = requestHistory.find(item => {
+        if (item.usageReceived) {
+            return false;
+        }
+        if (eventData.model && item.model && eventData.model !== item.model) {
+            return false;
+        }
+        if (eventData.source && item.source && eventData.source !== item.source) {
+            return false;
+        }
+        return true;
+    }) || requestHistory.find(item => !item.usageReceived);
     if (!record) {
         return null;
     }
@@ -1113,6 +1239,8 @@ function installFetchObserver() {
                 }
             }
 
+            handleGenerationSettings(requestJson);
+            rememberRequestRecordFromFetch(requestBody, requestJson);
             rememberBackendBodyFromFetch(requestBody, requestJson);
 
             const contentType = response.headers?.get?.('content-type') || '';
