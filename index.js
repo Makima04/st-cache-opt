@@ -276,6 +276,12 @@ async function saveSnapshotToDb(record) {
             id: record.id,
             at: record.at,
             model: record.model,
+            source: record.source,
+            stream: record.stream,
+            type: record.type,
+            status: record.status,
+            recordPath: record.recordPath,
+            usagePath: record.usagePath,
             usage: record.usage,
             stats: record.stats,
             messageCount: messages.length,
@@ -436,6 +442,8 @@ function makeRequestRecord({ messages, stats, analysis, serializedPrompt, merged
         messageSignatures: signatures,
         serializedPrompt,
         usage: null,
+        recordPath: 'event_prompt_ready',
+        usagePath: '',
         mergedMessageSignatures: merged ? getMessageSignatures(merged) : null,
         mergedMessageCount: merged?.length ?? null,
     };
@@ -499,6 +507,7 @@ function rememberRequestRecordFromFetch(requestBody, requestJson = {}) {
         latest.type = type || latest.type;
         latest.settingsSignature = settingsSignature;
         latest.requestBodyHash = hashString(typeof requestBody === 'string' ? requestBody : '');
+        latest.recordPath = latest.recordPath === 'event_prompt_ready' ? 'event_plus_fetch' : (latest.recordPath || 'fetch_generate');
         saveSnapshotToDb(latest);
         return latest;
     }
@@ -551,6 +560,7 @@ function rememberRequestRecordFromFetch(requestBody, requestJson = {}) {
     record.type = type;
     record.settingsSignature = settingsSignature;
     record.requestBodyHash = hashString(typeof requestBody === 'string' ? requestBody : '');
+    record.recordPath = 'fetch_generate';
 
     rememberRequestRecord(record);
 
@@ -591,6 +601,7 @@ function updateLatestRequestWithUsage(eventData) {
     record.model = eventData.model || record.model;
     record.stream = Boolean(eventData.stream);
     record.type = eventData.type || record.type;
+    record.usagePath = eventData.usagePath || eventData.path || 'unknown';
     record.usageAt = new Date();
     record.settingsSignature = getRequestSettingsSignature(lastGenerationSettings);
     return record;
@@ -622,6 +633,7 @@ function maybeHandleUsageFromResponse(data, requestInfo = {}) {
         model: requestInfo.model || data.model || lastGenerationSettings?.model || '',
         stream: Boolean(requestInfo.stream ?? lastGenerationSettings?.stream),
         type: requestInfo.type || lastGenerationSettings?.type || '',
+        usagePath: requestInfo.usagePath || 'fetch_json_response',
     });
 }
 
@@ -641,7 +653,11 @@ function maybeHandleUsageFromStreamText(text, requestInfo = {}) {
         try {
             const data = JSON.parse(payload);
             if (data?.usage) {
-                maybeHandleUsageFromResponse(data, requestInfo);
+                maybeHandleUsageFromResponse(data, {
+                    ...requestInfo,
+                    usagePath: requestInfo.usagePath || 'fetch_stream_text',
+                });
+                return;
             }
         } catch {
             // Ignore non-JSON event chunks.
@@ -661,6 +677,29 @@ function getRequestOptionRows(selectedId = '') {
         ].filter(Boolean).join(' / ');
         return `<option value="${escapeHtml(record.id)}" ${record.id === selectedId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     }).join('');
+}
+
+function getRecordPathMeta(path = '') {
+    const map = {
+        event_prompt_ready: { label: '事件记录', className: 'success', title: 'CHAT_COMPLETION_PROMPT_READY 创建请求快照，说明 SillyTavern 事件链路有效。' },
+        fetch_generate: { label: 'fetch 兜底', className: 'warn', title: '从实际 /generate HTTP 请求体创建快照，说明事件记录链路未创建或未命中。' },
+        event_plus_fetch: { label: '事件+fetch', className: 'success', title: '事件先创建快照，fetch 又用真实请求体补齐模型/来源等字段，是当前最完整链路。' },
+    };
+    return map[path] || { label: path || '未知', className: 'muted', title: '未知记录链路，需要查看快照 JSON。' };
+}
+
+function getUsagePathMeta(path = '') {
+    const map = {
+        fetch_json_response: { label: 'JSON usage', className: 'success', title: 'fetch 观察器从非流式 JSON 响应捕获 usage，是真实有效链路。' },
+        fetch_stream_text: { label: '流式 usage', className: 'success', title: 'fetch 观察器从流式 SSE 文本捕获 usage，是真实有效链路。' },
+        st_event_usage: { label: 'ST usage 事件', className: 'success', title: 'SillyTavern 原生 CHAT_COMPLETION_RESPONSE_USAGE 事件返回 usage。当前本地版本可能没有该事件。' },
+        unknown: { label: '未知 usage', className: 'muted', title: '收到了 usage，但来源没有标记。' },
+    };
+    return map[path] || { label: path || '未收到', className: path ? 'muted' : 'danger', title: path ? '未知 usage 链路。' : '本次请求还没有收到后端 usage。' };
+}
+
+function renderPathBadge(meta) {
+    return `<span class="dco-path-badge dco-path-badge--${escapeHtml(meta.className)}" title="${escapeHtml(meta.title || '')}">${escapeHtml(meta.label)}</span>`;
 }
 
 function getRequestById(id) {
@@ -702,6 +741,8 @@ function getMessageDiffReport(leftId = '', rightId = '') {
         `对比：${left.id} -> ${right.id}`,
         `时间：${left.at?.toLocaleString?.() || ''} -> ${right.at?.toLocaleString?.() || ''}`,
         `模型：${left.model || '未知'} -> ${right.model || '未知'}；模式：${left.stream ? '流式' : '非流式'} -> ${right.stream ? '流式' : '非流式'}`,
+        `记录链路：${getRecordPathMeta(left.recordPath).label} -> ${getRecordPathMeta(right.recordPath).label}`,
+        `usage 链路：${getUsagePathMeta(left.usagePath).label} -> ${getUsagePathMeta(right.usagePath).label}`,
         `usage：${left.usageReceived ? '已收到' : '未收到'} -> ${right.usageReceived ? '已收到' : '未收到'}`,
         `后端命中：${formatNumber(leftMetrics.cachedTokens)} / ${formatNumber(leftMetrics.promptTokens)} -> ${formatNumber(rightMetrics.cachedTokens)} / ${formatNumber(rightMetrics.promptTokens)}`,
         `最终前缀：${left.stats?.rawPrefixPercent ?? 0}% -> ${right.stats?.rawPrefixPercent ?? 0}%`,
@@ -735,6 +776,10 @@ function getRequestJson(record = requestHistory[0]) {
         model: record.model,
         stream: record.stream,
         status: record.status,
+        source: record.source,
+        type: record.type,
+        recordPath: record.recordPath,
+        usagePath: record.usagePath,
         usage: record.usage,
         stats: record.stats,
         messages: record.messages,
@@ -1195,7 +1240,10 @@ function handleBackendUsage(eventData) {
         requestSettingsSignature: getRequestSettingsSignature(lastGenerationSettings),
         requestType: lastGenerationSettings?.type || eventData.type || '',
     };
-    const record = updateLatestRequestWithUsage(eventData);
+    const record = updateLatestRequestWithUsage({
+        usagePath: 'st_event_usage',
+        ...eventData,
+    });
     if (record) {
         record.stats = structuredClone(lastStats);
         saveSnapshotToDb(record);
@@ -1251,6 +1299,7 @@ function installFetchObserver() {
                         model: requestJson.model,
                         stream: requestJson.stream,
                         type: requestJson.type,
+                        usagePath: 'fetch_json_response',
                     }))
                     .catch(() => {});
             } else if (response.ok && requestJson?.stream) {
@@ -1260,6 +1309,7 @@ function installFetchObserver() {
                         model: requestJson.model,
                         stream: requestJson.stream,
                         type: requestJson.type,
+                        usagePath: 'fetch_stream_text',
                     }))
                     .catch(() => {});
             }
@@ -1925,10 +1975,14 @@ function getHistoryRows() {
     return requestHistory.map((record, index) => {
         const metrics = getUsageMetrics(record.usage);
         const stats = record.stats || {};
+        const recordPath = renderPathBadge(getRecordPathMeta(record.recordPath));
+        const usagePath = renderPathBadge(getUsagePathMeta(record.usagePath));
         return `
             <tr>
                 <td>${escapeHtml(record.id || `#${requestHistory.length - index}`)}</td>
                 <td>${escapeHtml(record.at?.toLocaleTimeString?.() || '')}</td>
+                <td>${recordPath}</td>
+                <td>${usagePath}</td>
                 <td>${escapeHtml(record.model || '')}</td>
                 <td>${record.stream ? '流式' : '非流式'}</td>
                 <td>${formatNumber(metrics.promptTokens)}</td>
@@ -2215,11 +2269,11 @@ async function openPanel(activeTab = 'optimizer') {
                             <table class="dco-table">
                                 <thead>
                                     <tr>
-                                        <th>轮次</th><th>时间</th><th>模型</th><th>模式</th><th>Prompt</th>
+                                        <th>轮次</th><th>时间</th><th>记录链路</th><th>usage 链路</th><th>模型</th><th>模式</th><th>Prompt</th>
                                         <th>命中</th><th>未命中</th><th>后端命中率</th><th>最终前缀</th><th>插件影响</th><th>首变</th>
                                     </tr>
                                 </thead>
-                                <tbody>${historyRows || '<tr><td colspan="12">暂无请求。生成一次后会立刻记录；即使流式 usage 没返回也会保留。</td></tr>'}</tbody>
+                                <tbody>${historyRows || '<tr><td colspan="13">暂无请求。生成一次后会立刻记录；即使流式 usage 没返回也会保留。</td></tr>'}</tbody>
                             </table>
                         </div>
                     </section>
@@ -2524,8 +2578,12 @@ export async function init() {
                     id: snap.id,
                     at: snap.at,
                     model: snap.model,
-                    stream: false,
-                    status: snap.usage ? '已收到 usage' : '来自历史',
+                    source: snap.source || '',
+                    stream: Boolean(snap.stream),
+                    type: snap.type || '',
+                    status: snap.status || (snap.usage ? '已收到 usage' : '来自历史'),
+                    recordPath: snap.recordPath || 'unknown',
+                    usagePath: snap.usagePath || '',
                     usageReceived: Boolean(snap.usage),
                     usage: snap.usage,
                     stats: snap.stats,
